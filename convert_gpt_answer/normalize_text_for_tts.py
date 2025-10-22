@@ -10,6 +10,9 @@ CURRENCY_MAP = {
     '¥': ('иена', 'иены', 'иен'),
 }
 
+WORD_RE = re.compile(r"[^\W\d_]+", flags=re.UNICODE)
+TERM_CHARS = ".!?"
+
 
 def declension_ru(n, forms):
     """Выбирает правильную форму слова по правилу русского языка."""
@@ -160,6 +163,58 @@ def normalize_text_for_tts(text: str) -> str:
     return text
 
 
+def normalize_register(text: str) -> str:
+    """
+    - После .!? следующее слово с большой буквы.
+    - Если слово полностью капсом — сохраняем.
+    - Иначе: в начале предложения — ПерваяБольшая, в остальных местах — все малые.
+    - Добавляет пробел после .!? если его не было.
+    """
+    res = []
+    pos = 0
+    sentence_start = True
+
+    while True:
+        m = WORD_RE.search(text, pos)
+        if not m:
+            res.append(text[pos:])
+            break
+
+        between = text[pos:m.start()]
+        res.append(between)
+
+        # Начало нового предложения, если в промежутке были .!?
+        if any(ch in TERM_CHARS for ch in between):
+            sentence_start = True
+
+        # Если промежуток заканчивается .!? и нет пробела — вставим один
+        if between and between[-1] in TERM_CHARS:
+            res.append(" ")
+
+        word = m.group(0)
+
+        if word.isupper():
+            norm = word
+        else:
+            norm = word[0].upper() + word[1:].lower() if sentence_start else word.lower()
+
+        res.append(norm)
+        pos = m.end()
+        sentence_start = False
+
+    return "".join(res)
+
+
 if __name__ == "__main__":
     sample = "доступно 2 956, общий баланс 3420, что эквивалентно $44,613"
     print(normalize_text_for_tts(sample))
+
+    # Тесты
+    print(normalize_register("ПриВЕТ, кАк дЕлА?"))
+    # Вывод: Привет, как дела?
+
+    print(normalize_register("Привет, КАК дела?"))
+    # Вывод: Привет, КАК дела?
+
+    print(normalize_register("это тест. А ТЕПЕРЬ ВТОРОЕ ПРЕДЛОЖЕНИЕ!"))
+    # Вывод: Это тест. А теперь второе предложение!

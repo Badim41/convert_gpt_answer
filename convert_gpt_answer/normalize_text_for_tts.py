@@ -288,7 +288,7 @@ def normalize_text_for_tts(text: str) -> str:
     # text = text.replace(',', ' ')
     text = re.sub(r'\s+', ' ', text).strip()
     # исправить случаи слипшихся "иX" -> "и X"
-    text = re.sub(r'\bи(?=[А-Яа-яЁё])', 'и ', text)
+    text = re.sub(r'\bи(?=[А-ЯЁ])', 'и ', text)
 
     text = re.sub(r'\s+([,.;:?!])', r'\1', text)
     text = re.sub(r'([,.;:?!])(?=[^\s"\'\)\]\}])', r'\1 ', text)
@@ -333,6 +333,8 @@ def normalize_register(text: str) -> str:
 # Тестирование: верные/неверные тесты
 # ---------------------------
 if __name__ == "__main__":
+    print(normalize_text_for_tts("истина им"))
+    exit()
     tests = [
         ("5-7=", "пять минус семь ровно"),
         ("5-7 = ", "пять минус семь ровно"),

@@ -45,10 +45,10 @@ def parse_input():
     for line in lines:
         stripped = line.strip()
 
-        # Поддержка маркеров любой длины от 4 символов (<<<<, <<<<<<< и т.д.)
-        is_start = len(stripped) >= 4 and stripped == '<' * len(stripped)
-        is_mid = len(stripped) >= 4 and stripped == '=' * len(stripped)
-        is_end = len(stripped) >= 4 and stripped == '>' * len(stripped)
+        # Поддержка маркеров любой длины от 4 символов с возможностью комментариев или имен файлов в конце
+        is_start = stripped.startswith('<<<<')
+        is_mid = stripped.startswith('====') and len(stripped.replace('=', '').strip()) == 0
+        is_end = stripped.startswith('>>>>')
 
         if state == 0:
             if is_start:
@@ -87,6 +87,19 @@ def parse_input():
     return blocks
 
 
+import difflib
+
+def is_binary_file(filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            chunk = f.read(1024)
+            if b'\x00' in chunk:
+                return True
+            return False
+    except IOError:
+        return True
+
+
 def get_all_text_files(root_dir='.'):
     text_files = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -94,22 +107,109 @@ def get_all_text_files(root_dir='.'):
 
         for file in filenames:
             file_path = os.path.join(dirpath, file)
-            is_text = False
-            for enc in ['utf-8', 'utf-8-sig', 'cp1251']:
-                try:
-                    with open(file_path, 'r', encoding=enc) as f:
-                        f.read(1024)
-                    is_text = True
-                    break
-                except UnicodeDecodeError:
-                    pass
-            if is_text:
+            if not is_binary_file(file_path):
                 text_files.append(file_path)
     return text_files
 
 
 def normalize_str(s):
     return re.sub(r'\s+', ' ', s.strip())
+
+
+def compute_mismatch_stats(search_lines, candidate_lines):
+    search_text = "\n".join(normalize_str(l) for l in search_lines)
+    cand_text = "\n".join(normalize_str(l) for l in candidate_lines)
+
+    char_matcher = difflib.SequenceMatcher(None, search_text, cand_text)
+    char_ratio = char_matcher.ratio()
+    char_similarity_pct = char_ratio * 100
+    char_mismatch_pct = 100.0 - char_similarity_pct
+
+    total_chars = max(len(search_text), len(cand_text))
+    char_matches = sum(triple.size for triple in char_matcher.get_matching_blocks())
+    mismatched_chars = total_chars - char_matches
+
+    s_norm = [normalize_str(l) for l in search_lines]
+    c_norm = [normalize_str(l) for l in candidate_lines]
+    line_matcher = difflib.SequenceMatcher(None, s_norm, c_norm)
+    line_ratio = line_matcher.ratio()
+    line_similarity_pct = line_ratio * 100
+    line_mismatch_pct = 100.0 - line_similarity_pct
+
+    total_lines = max(len(s_norm), len(c_norm))
+    line_matches = sum(triple.size for triple in line_matcher.get_matching_blocks())
+    mismatched_lines = total_lines - line_matches
+
+    return {
+        'mismatched_chars': mismatched_chars,
+        'char_mismatch_pct': char_mismatch_pct,
+        'mismatched_lines': mismatched_lines,
+        'line_mismatch_pct': line_mismatch_pct,
+        'char_similarity_pct': char_similarity_pct,
+        'line_similarity_pct': line_similarity_pct
+    }
+
+
+def find_best_matches(search_lines, file_lines, threshold=0.4):
+    s_norm = [normalize_str(l) for l in search_lines]
+    f_norm = [normalize_str(l) for l in file_lines]
+
+    n_s = len(s_norm)
+    n_f = len(f_norm)
+
+    if n_s == 0 or n_f == 0:
+        return []
+
+    exact = find_matches(search_lines, file_lines)
+    if exact:
+        return [{'start': m[0], 'end': m[1], 'ratio': 1.0} for m in exact]
+
+    matcher = difflib.SequenceMatcher(None, s_norm, f_norm)
+    matching_blocks = matcher.get_matching_blocks()
+
+    potential_starts = set()
+    for s_idx, f_idx, length in matching_blocks:
+        if length == 0:
+            continue
+        est_start = max(0, min(n_f - 1, f_idx - s_idx))
+        potential_starts.add(est_start)
+
+    refined_starts = set()
+    for ps in potential_starts:
+        for offset in range(-5, 6):
+            ns = ps + offset
+            if 0 <= ns < n_f:
+                refined_starts.add(ns)
+
+    best_candidate_for_start = {}
+    for start in refined_starts:
+        min_len = max(1, int(n_s * 0.5))
+        max_len = min(n_f - start, int(n_s * 1.5))
+        for length in range(min_len, max_len + 1):
+            end = start + length
+            cand_sub = f_norm[start:end]
+
+            line_ratio = difflib.SequenceMatcher(None, s_norm, cand_sub).ratio()
+            if line_ratio >= threshold:
+                if start not in best_candidate_for_start or line_ratio > best_candidate_for_start[start]['ratio']:
+                    best_candidate_for_start[start] = {
+                        'start': start,
+                        'end': end,
+                        'ratio': line_ratio
+                    }
+
+    sorted_candidates = sorted(best_candidate_for_start.values(), key=lambda x: x['ratio'], reverse=True)
+    non_overlapping = []
+    for cand in sorted_candidates:
+        overlap = False
+        for existing in non_overlapping:
+            if not (cand['end'] <= existing['start'] or cand['start'] >= existing['end']):
+                overlap = True
+                break
+        if not overlap:
+            non_overlapping.append(cand)
+
+    return non_overlapping
 
 
 def find_matches(search_lines, file_lines):
@@ -141,16 +241,18 @@ def main():
 
     print(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
 
-    # 1. Чтение всех файлов
+    # 1. Чтение всех файлов с автоопределением кодировки
     files = get_all_text_files()
     file_contents = {}
+    file_encodings = {}
     for f in files:
-        for enc in ['utf-8', 'utf-8-sig', 'cp1251']:
+        for enc in ['utf-8', 'utf-8-sig', 'cp1251', 'latin-1']:
             try:
                 with open(f, 'r', encoding=enc) as fp:
                     file_contents[f] = fp.read().splitlines()
+                file_encodings[f] = enc
                 break
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, LookupError):
                 pass
 
     # 2. Поиск совпадений
@@ -159,79 +261,89 @@ def main():
         search_lines = block['search']
         matches_for_block = []
 
-        # Сначала пробуем найти точное совпадение
+        # Поиск потенциальных кандидатов во всех файлах
+        candidates = []
         for path, lines in file_contents.items():
-            matches = find_matches(search_lines, lines)
-            for m in matches:
-                matches_for_block.append((path, m[0], m[1]))
+            file_candidates = find_best_matches(search_lines, lines, threshold=0.4)
+            for cand in file_candidates:
+                candidates.append({
+                    'path': path,
+                    'start': cand['start'],
+                    'end': cand['end'],
+                    'ratio': cand['ratio']
+                })
 
-        # Нечеткий поиск, если точных совпадений нет
-        if not matches_for_block:
-            n_s = len(search_lines)
-            if n_s >= 2:  # Нечеткий поиск имеет смысл при длине блока от 2 строк
-                tolerance = max(1, int(n_s * 0.05))
-                fuzzy_candidates = []
+        # Сортировка по совпадению (сначала наиболее похожие)
+        candidates.sort(key=lambda x: x['ratio'], reverse=True)
 
-                for path, lines in file_contents.items():
-                    n_f = len(lines)
-                    for L in range(n_s - tolerance, n_s + tolerance + 1):
-                        if L <= 0 or L > n_f:
-                            continue
+        # Если найдено точное совпадение (ratio > 0.999), берем его без лишних вопросов
+        exact_candidates = [c for c in candidates if c['ratio'] >= 0.999]
+        if exact_candidates:
+            for ec in exact_candidates:
+                matches_for_block.append((ec['path'], ec['start'], ec['end']))
+        else:
+            # Иначе запрашиваем подтверждение для лучших нечетких совпадений
+            for cand in candidates:
+                path = cand['path']
+                start = cand['start']
+                end = cand['end']
 
-                        for start_idx in range(n_f - L + 1):
-                            # Сравниваем первую и последнюю строки
-                            if (normalize_str(lines[start_idx]) == normalize_str(search_lines[0]) and
-                                    normalize_str(lines[start_idx + L - 1]) == normalize_str(search_lines[-1])):
+                candidate_lines = file_contents[path][start:end]
+                stats = compute_mismatch_stats(search_lines, candidate_lines)
 
-                                # Собираем расхождения строк
-                                mismatches = []
-                                max_len = max(n_s, L)
-                                for j in range(max_len):
-                                    if j < n_s and j < L:
-                                        s_norm = normalize_str(search_lines[j])
-                                        f_norm = normalize_str(lines[start_idx + j])
-                                        if s_norm != f_norm:
-                                            mismatches.append((j + 1, search_lines[j], lines[start_idx + j]))
-                                    elif j < n_s:
-                                        mismatches.append((j + 1, search_lines[j], "<строка отсутствует в файле>"))
-                                    else:
-                                        mismatches.append(
-                                            (j + 1, "<строка отсутствует в поиске>", lines[start_idx + j]))
+                print(f"\n{Colors.YELLOW}Найден похожий блок в файле {path}:{Colors.RESET}")
+                print(f"Блок {idx + 1}:")
+                print(f"Начальная строка: {start + 1}")
+                print(f"Конечная строка: {end}")
+                print(f"Сходство кода: {stats['char_similarity_pct']:.1f}%")
+                print(f"несоответствует символов: {stats['mismatched_chars']} ({stats['char_mismatch_pct']:.1f}%)")
+                print(f"несоответствует строк: {stats['mismatched_lines']} ({stats['line_mismatch_pct']:.1f}%)")
 
-                                fuzzy_candidates.append({
-                                    'path': path,
-                                    'start': start_idx,
-                                    'end': start_idx + L,
-                                    'mismatches': mismatches
-                                })
+                # Показ подробностей разницы
+                s_norm = [normalize_str(l) for l in search_lines]
+                c_norm = [normalize_str(l) for l in candidate_lines]
+                line_matcher = difflib.SequenceMatcher(None, s_norm, c_norm)
 
-                for cand in fuzzy_candidates:
-                    print(f"\n{Colors.YELLOW}Найден похожий блок в файле {cand['path']}:{Colors.RESET}")
-                    print(f"Блок {idx + 1}:")
-                    print(f"Начальная строка: {cand['start'] + 1}")
-                    print(f"Конечная строка: {cand['end']}")
-
-                    m_count = len(cand['mismatches'])
-                    if m_count > 0:
-                        print("Не совпадают строки:")
-                        if m_count < 10:
-                            for pos, s_line, f_line in cand['mismatches']:
-                                print(f"  Строка {pos}:")
+                print("Детализация расхождений:")
+                opcodes = line_matcher.get_opcodes()
+                for tag, i1, i2, j1, j2 in opcodes:
+                    if tag == 'replace':
+                        for idx_s in range(i1, i2):
+                            s_line = search_lines[idx_s]
+                            idx_c = j1 + (idx_s - i1)
+                            if idx_c < j2:
+                                c_line = candidate_lines[idx_c]
+                                line_diff_ratio = difflib.SequenceMatcher(None, normalize_str(s_line), normalize_str(c_line)).ratio()
+                                line_char_mismatch_pct = (1.0 - line_diff_ratio) * 100
+                                print(f"  Строка {idx_s + 1} (несоответствует символов: {line_char_mismatch_pct:.1f}%):")
                                 print(f"    Ожидалось: {Colors.RED}{s_line.strip()}{Colors.RESET}")
-                                print(f"    Найдено  : {Colors.GREEN}{f_line.strip()}{Colors.RESET}")
-                        else:
-                            print(f"  (Всего не совпадает строк: {m_count})")
-                    else:
-                        print("Все внутренние строки совпадают.")
+                                print(f"    Найдено  : {Colors.GREEN}{c_line.strip()}{Colors.RESET}")
+                            else:
+                                print(f"  Строка {idx_s + 1} (удалена):")
+                                print(f"    Ожидалось: {Colors.RED}{s_line.strip()}{Colors.RESET}")
+                    elif tag == 'delete':
+                        for idx_s in range(i1, i2):
+                            s_line = search_lines[idx_s]
+                            print(f"  Строка {idx_s + 1} (отсутствует в файле):")
+                            print(f"    Ожидалось: {Colors.RED}{s_line.strip()}{Colors.RESET}")
+                    elif tag == 'insert':
+                        for idx_c in range(j1, j2):
+                            c_line = candidate_lines[idx_c]
+                            print(f"  Лишняя строка в файле:")
+                            print(f"    Найдено  : {Colors.GREEN}{c_line.strip()}{Colors.RESET}")
 
+                try:
                     ans = input("Подтвердить? y/n: ").strip().lower()
-                    if ans in ['y', 'yes', 'да', '1']:
-                        matches_for_block.append((cand['path'], cand['start'], cand['end']))
-                        break  # Нашли подтвержденного кандидата, переходим к следующему блоку
+                except EOFError:
+                    ans = 'n'
+
+                if ans in ['y', 'yes', 'да', '1']:
+                    matches_for_block.append((path, start, end))
+                    break
 
         block_matches.append(matches_for_block)
 
-    # 3. Валидация (DRY RUN)
+    # 3. Валидация
     errors = []
     missing_blocks = 0
     duplicate_blocks = 0
@@ -260,7 +372,7 @@ def main():
         for err in errors:
             print(f"{Colors.RED}{err}{Colors.RESET}")
             print(f"{Colors.YELLOW}{'-' * 60}{Colors.RESET}")
-        sys.exit(1)
+        return False
 
     # 4. Применение правок
     file_modifications = {f: [] for f in file_contents}
@@ -289,13 +401,16 @@ def main():
 
             s_base_len = 0
             f_base_str = ""
-            for j in range(len(search_lines)):
-                if search_lines[j].strip():
+            for j in range(min(len(search_lines), len(lines) - start)):
+                if search_lines[j].strip() and lines[start + j].strip():
                     s_line = search_lines[j]
                     s_base_len = len(s_line) - len(s_line.lstrip())
                     f_line = lines[start + j]
                     f_base_str = f_line[:len(f_line) - len(f_line.lstrip())]
                     break
+
+            f_base_len = len(f_base_str)
+            indent_char = '\t' if '\t' in f_base_str else ' '
 
             new_lines = []
             for r_line in replace_lines:
@@ -304,27 +419,41 @@ def main():
                     continue
 
                 r_indent = len(r_line) - len(r_line.lstrip())
-                extra = r_indent - s_base_len
-                if extra < 0:
-                    extra = 0
-
-                extra_str = r_line[s_base_len: s_base_len + extra] if r_indent >= s_base_len else ""
-                new_line = f_base_str + extra_str + r_line.lstrip()
+                relative_indent = r_indent - s_base_len
+                target_indent_len = max(0, f_base_len + relative_indent)
+                new_line = (indent_char * target_indent_len) + r_line.lstrip()
                 new_lines.append(new_line)
 
             lines = lines[:start] + new_lines + lines[end:]
 
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write("\n".join(lines) + "\n")
+        # Атомарная запись с сохранением оригинальной кодировки
+        temp_path = path + ".tmp"
+        try:
+            enc = file_encodings.get(path, 'utf-8')
+            with open(temp_path, 'w', encoding=enc) as f:
+                f.write("\n".join(lines) + "\n")
+            if os.path.exists(path):
+                os.replace(temp_path, path)
+            else:
+                os.rename(temp_path, path)
+        except Exception as e:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            print(f"{Colors.RED}Ошибка при записи файла {path}: {e}{Colors.RESET}")
+            return False
 
         print(f"Обновлен файл: {Colors.YELLOW}{path}{Colors.RESET}")
         files_changed += 1
 
     print(f"\n{Colors.GREEN}{'=' * 60}")
-    print(f"УСПЕХ! Правки применены.")
+    print(f"Правки применены.")
     print(f"Всего обработано блоков: {len(blocks)}")
     print(f"Изменено файлов: {files_changed}")
     print(f"{'=' * 60}{Colors.RESET}")
+    return True
 
 
 def run_replacer():
@@ -333,6 +462,7 @@ def run_replacer():
             main()
         except KeyboardInterrupt:
             print(f"\n{Colors.YELLOW}Операция прервана пользователем.{Colors.RESET}")
+            break
 
 
 if __name__ == '__main__':

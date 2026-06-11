@@ -150,66 +150,68 @@ def compute_mismatch_stats(search_lines, candidate_lines):
     }
 
 
-def find_best_matches(search_lines, file_lines, threshold=0.4):
-    s_norm = [normalize_str(l) for l in search_lines]
-    f_norm = [normalize_str(l) for l in file_lines]
+def find_anchors_match(search_lines, file_lines):
+    # 1. Очистка от пустых строк в начале и в конце
+    s_clean = search_lines[:]
+    while s_clean and not s_clean[0].strip():
+        s_clean.pop(0)
+    while s_clean and not s_clean[-1].strip():
+        s_clean.pop()
 
-    n_s = len(s_norm)
-    n_f = len(f_norm)
-
-    if n_s == 0 or n_f == 0:
+    # 2. Если строк меньше 4, якорный поиск не применим
+    if len(s_clean) < 4:
         return []
 
-    exact = find_matches(search_lines, file_lines)
-    if exact:
-        return [{'start': m[0], 'end': m[1], 'ratio': 1.0} for m in exact]
+    s_norm = [normalize_str(l) for l in s_clean]
+    f_norm = [normalize_str(l) for l in file_lines]
 
-    matcher = difflib.SequenceMatcher(None, s_norm, f_norm)
-    matching_blocks = matcher.get_matching_blocks()
+    def get_anchor_indices(anchor, target_lines, start_index=0):
+        matches = []
+        a_len = len(anchor)
+        for i in range(start_index, len(target_lines) - a_len + 1):
+            if target_lines[i:i+a_len] == anchor:
+                matches.append(i)
+        return matches
 
-    potential_starts = set()
-    for s_idx, f_idx, length in matching_blocks:
-        if length == 0:
-            continue
-        est_start = max(0, min(n_f - 1, f_idx - s_idx))
-        potential_starts.add(est_start)
+    # 6. Динамическое расширение якорей до len(s_clean) // 2
+    max_anchor_len = max(3, len(s_clean) // 2)
 
-    refined_starts = set()
-    for ps in potential_starts:
-        for offset in range(-5, 6):
-            ns = ps + offset
-            if 0 <= ns < n_f:
-                refined_starts.add(ns)
+    # 3-4. Поиск Top Anchor (Верхний якорь)
+    top_anchor_len = 3
+    start_idx_matches = []
+    while top_anchor_len <= max_anchor_len:
+        top_anchor = s_norm[:top_anchor_len]
+        start_idx_matches = get_anchor_indices(top_anchor, f_norm)
+        if len(start_idx_matches) == 1:
+            break
+        top_anchor_len += 1
 
-    best_candidate_for_start = {}
-    for start in refined_starts:
-        min_len = max(1, int(n_s * 0.5))
-        max_len = min(n_f - start, int(n_s * 1.5))
-        for length in range(min_len, max_len + 1):
-            end = start + length
-            cand_sub = f_norm[start:end]
+    # Если уникальный верхний якорь не найден (либо 0, либо > 1 раз)
+    if len(start_idx_matches) != 1:
+        return []
 
-            line_ratio = difflib.SequenceMatcher(None, s_norm, cand_sub).ratio()
-            if line_ratio >= threshold:
-                if start not in best_candidate_for_start or line_ratio > best_candidate_for_start[start]['ratio']:
-                    best_candidate_for_start[start] = {
-                        'start': start,
-                        'end': end,
-                        'ratio': line_ratio
-                    }
+    start_idx = start_idx_matches[0]
 
-    sorted_candidates = sorted(best_candidate_for_start.values(), key=lambda x: x['ratio'], reverse=True)
-    non_overlapping = []
-    for cand in sorted_candidates:
-        overlap = False
-        for existing in non_overlapping:
-            if not (cand['end'] <= existing['start'] or cand['start'] >= existing['end']):
-                overlap = True
-                break
-        if not overlap:
-            non_overlapping.append(cand)
+    # 3-4. Поиск Bottom Anchor (Нижний якорь)
+    bottom_anchor_len = 3
+    end_idx_matches = []
+    while bottom_anchor_len <= max_anchor_len:
+        bottom_anchor = s_norm[-bottom_anchor_len:]
+        # Ищем только начиная с найденного начала блока
+        end_idx_matches = get_anchor_indices(bottom_anchor, f_norm, start_idx)
+        if len(end_idx_matches) == 1:
+            break
+        bottom_anchor_len += 1
 
-    return non_overlapping
+    # Если уникальный нижний якорь не найден
+    if len(end_idx_matches) != 1:
+        return []
+
+    end_anchor_start_idx = end_idx_matches[0]
+    end_idx = end_anchor_start_idx + bottom_anchor_len
+
+    # 5. Возврат результата
+    return [{'start': start_idx, 'end': end_idx, 'ratio': 0.95}]
 
 
 def find_matches(search_lines, file_lines):
@@ -265,7 +267,20 @@ def main():
         # Поиск потенциальных кандидатов во всех файлах
         candidates = []
         for path, lines in file_contents.items():
-            file_candidates = find_best_matches(search_lines, lines, threshold=0.4)
+            # Шаг 1: Проверка полного точного совпадения
+            exact_matches = find_matches(search_lines, lines)
+            if exact_matches:
+                for m in exact_matches:
+                    candidates.append({
+                        'path': path,
+                        'start': m[0],
+                        'end': m[1],
+                        'ratio': 1.0
+                    })
+                continue
+
+            # Если точного совпадения нет, используем якорный поиск
+            file_candidates = find_anchors_match(search_lines, lines)
             for cand in file_candidates:
                 candidates.append({
                     'path': path,

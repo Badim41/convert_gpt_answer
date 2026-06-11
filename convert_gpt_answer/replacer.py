@@ -257,6 +257,7 @@ def main():
 
     # 2. Поиск совпадений
     block_matches = []
+    already_applied_blocks = set()
     for idx, block in enumerate(blocks):
         search_lines = block['search']
         matches_for_block = []
@@ -341,6 +342,21 @@ def main():
                     matches_for_block.append((path, start, end))
                     break
 
+        if not matches_for_block:
+            replace_lines = block['replace']
+            if len(replace_lines) > 0:
+                is_applied = False
+                for path, lines in file_contents.items():
+                    # Проверяем, есть ли уже блок замены в каком-либо файле
+                    if find_matches(replace_lines, lines):
+                        is_applied = True
+                        break
+                if is_applied:
+                    already_applied_blocks.add(idx)
+            else:
+                # Если блок замены пустой, а блок поиска не найден, возможно он уже удален
+                already_applied_blocks.add(idx)
+
         block_matches.append(matches_for_block)
 
     # 3. Валидация
@@ -350,6 +366,9 @@ def main():
 
     for idx, matches in enumerate(block_matches):
         if len(matches) == 0:
+            if idx in already_applied_blocks:
+                print(f"{Colors.GREEN}Блок {idx + 1} пропущен: похоже, правки уже внесены.{Colors.RESET}")
+                continue
             err_msg = f"Блок {idx + 1} НЕ НАЙДЕН НИ В ОДНОМ ФАЙЛЕ.\nОригинальный текст, который мы искали:\n" + "\n".join(
                 blocks[idx]['search'])
             errors.append(err_msg)

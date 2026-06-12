@@ -411,6 +411,10 @@ def main():
     # 4. Применение правок
     file_modifications = {f: [] for f in file_contents}
     for idx, matches in enumerate(block_matches):
+        if not matches:
+            # Пропускаем блоки, которые не были найдены (или уже были применены)
+            continue
+
         path, start_idx, end_idx = matches[0]
         file_modifications[path].append({
             'start': start_idx,

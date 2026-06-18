@@ -100,12 +100,20 @@ def is_binary_file(filepath):
         return True
 
 
-def get_all_text_files(root_dir='.'):
+def get_all_text_files(root_dir='.', ignore_folders=None, ignore_files=None):
     text_files = []
+    folders_to_ignore = set(IGNORE_DIRS)
+    if ignore_folders:
+        folders_to_ignore.update(ignore_folders)
+
+    files_to_ignore = set(ignore_files) if ignore_files else set()
+
     for dirpath, dirnames, filenames in os.walk(root_dir):
-        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in folders_to_ignore]
 
         for file in filenames:
+            if file in files_to_ignore:
+                continue
             file_path = os.path.join(dirpath, file)
             if not is_binary_file(file_path):
                 text_files.append(file_path)
@@ -234,7 +242,7 @@ def find_matches(search_lines, file_lines):
     return matches
 
 
-def main():
+def main(ignore_folders=None, ignore_files=None):
     blocks = parse_input()
 
     if not blocks:
@@ -244,7 +252,7 @@ def main():
     print(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
 
     # 1. Чтение всех файлов с автоопределением кодировки
-    files = get_all_text_files()
+    files = get_all_text_files(ignore_folders=ignore_folders, ignore_files=ignore_files)
     file_contents = {}
     file_encodings = {}
     for f in files:
@@ -494,10 +502,10 @@ def main():
     return True
 
 
-def run_replacer():
+def run_replacer(ignore_folders=None, ignore_files=None):
     while True:
         try:
-            main()
+            main(ignore_folders=ignore_folders, ignore_files=ignore_files)
         except KeyboardInterrupt:
             print(f"\n{Colors.YELLOW}Операция прервана пользователем.{Colors.RESET}")
             break

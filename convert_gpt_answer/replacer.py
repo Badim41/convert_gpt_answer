@@ -267,7 +267,7 @@ def main(ignore_folders=None, ignore_files=None):
 
     # 2. Поиск совпадений
     block_matches = []
-    already_applied_blocks = set()
+    already_applied_blocks = {}
     for idx, block in enumerate(blocks):
         search_lines = block['search']
         matches_for_block = []
@@ -368,17 +368,17 @@ def main(ignore_folders=None, ignore_files=None):
         if not matches_for_block:
             replace_lines = block['replace']
             if len(replace_lines) > 0:
-                is_applied = False
+                applied_locs = []
                 for path, lines in file_contents.items():
                     # Проверяем, есть ли уже блок замены в каком-либо файле
-                    if find_matches(replace_lines, lines):
-                        is_applied = True
-                        break
-                if is_applied:
-                    already_applied_blocks.add(idx)
+                    found_replacements = find_matches(replace_lines, lines)
+                    for m in found_replacements:
+                        applied_locs.append((path, m[0], m[1]))
+                if applied_locs:
+                    already_applied_blocks[idx] = applied_locs
             else:
                 # Если блок замены пустой, а блок поиска не найден, возможно он уже удален
-                already_applied_blocks.add(idx)
+                already_applied_blocks[idx] = []
 
         block_matches.append(matches_for_block)
 
@@ -390,18 +390,38 @@ def main(ignore_folders=None, ignore_files=None):
     for idx, matches in enumerate(block_matches):
         if len(matches) == 0:
             if idx in already_applied_blocks:
-                print(f"{Colors.GREEN}Блок {idx + 1} пропущен: похоже, правки уже внесены.{Colors.RESET}")
-                continue
+                locs = already_applied_blocks[idx]
+                if locs:
+                    locs_str = "\n  - ".join([f"{p} (строки {s + 1}-{e})" for p, s, e in locs])
+                    print(f"\n{Colors.YELLOW}ВНИМАНИЕ: Для блока {idx + 1} оригинал не найден, но точная копия текста ЗАМЕНЫ уже присутствует в коде:{Colors.RESET}")
+                    print(f"  - {locs_str}")
+                    try:
+                        ans = input("похоже, правки уже внесены. Пропустить этот блок? (y/n): ").strip().lower()
+                    except EOFError:
+                        ans = 'n'
+                    if ans in ['y', 'yes', 'да', '1']:
+                        continue
+                else:
+                    print(f"{Colors.GREEN}Блок {idx + 1} пропущен: блок замены пуст, оригинал не найден (вероятно, уже удален).{Colors.RESET}")
+                    continue
+
             err_msg = f"Блок {idx + 1} НЕ НАЙДЕН НИ В ОДНОМ ФАЙЛЕ.\nОригинальный текст, который мы искали:\n" + "\n".join(
                 blocks[idx]['search'])
             errors.append(err_msg)
             missing_blocks += 1
         elif len(matches) > 1:
             locs = "\n  - ".join([f"{p} (строки {s + 1}-{e})" for p, s, e in matches])
-            err_msg = f"Блок {idx + 1} найден {len(matches)} раз (Неоднозначность!).\nГде найдено:\n  - {locs}\nОригинальный текст:\n" + "\n".join(
-                blocks[idx]['search'])
-            errors.append(err_msg)
-            duplicate_blocks += 1
+            print(f"\n{Colors.YELLOW}Блок {idx + 1} найден {len(matches)} раз (Неоднозначность!).\nГде найдено:\n  - {locs}{Colors.RESET}")
+            try:
+                ans = input("Применить замену ко всем найденным местам? (y/n): ").strip().lower()
+            except EOFError:
+                ans = 'n'
+
+            if ans not in ['y', 'yes', 'да', '1']:
+                err_msg = f"Блок {idx + 1} найден {len(matches)} раз.\nГде найдено:\n  - {locs}\nОригинальный текст:\n" + "\n".join(
+                    blocks[idx]['search'])
+                errors.append(err_msg)
+                duplicate_blocks += 1
 
     if errors:
         print(f"\n{Colors.RED}{'=' * 60}")
@@ -423,13 +443,14 @@ def main(ignore_folders=None, ignore_files=None):
             # Пропускаем блоки, которые не были найдены (или уже были применены)
             continue
 
-        path, start_idx, end_idx = matches[0]
-        file_modifications[path].append({
-            'start': start_idx,
-            'end': end_idx,
-            'replace': blocks[idx]['replace'],
-            'search': blocks[idx]['search']
-        })
+        for match in matches:
+            path, start_idx, end_idx = match
+            file_modifications[path].append({
+                'start': start_idx,
+                'end': end_idx,
+                'replace': blocks[idx]['replace'],
+                'search': blocks[idx]['search']
+            })
 
     files_changed = 0
     for path, mods in file_modifications.items():

@@ -42,7 +42,7 @@ def parse_input():
     current_search = []
     current_replace = []
 
-    for line in lines:
+    for line_idx, line in enumerate(lines):
         stripped = line.strip()
 
         # Поддержка маркеров любой длины от 4 символов с возможностью комментариев или имен файлов в конце
@@ -55,6 +55,8 @@ def parse_input():
                 state = 1
                 current_search = []
                 current_replace = []
+            elif stripped and not stripped.startswith('#') and stripped != '.,,,':
+                print(f"{Colors.RED}Предупреждение: игнорируется текст вне блоков (строка {line_idx + 1}): {stripped[:50]}...{Colors.RESET}")
         elif state == 1:
             if is_mid:
                 state = 2
@@ -93,7 +95,20 @@ def is_binary_file(filepath):
     try:
         with open(filepath, 'rb') as f:
             chunk = f.read(1024)
+            if chunk.startswith(b'\xff\xfe') or chunk.startswith(b'\xfe\xff'):
+                return False
             if b'\x00' in chunk:
+                test_len = min(len(chunk), 100)
+                if test_len % 2 != 0:
+                    test_len -= 1
+                test_chunk = chunk[:test_len]
+                if test_chunk:
+                    for enc in ['utf-16', 'utf-16le', 'utf-16be']:
+                        try:
+                            test_chunk.decode(enc)
+                            return False
+                        except UnicodeDecodeError:
+                            pass
                 return True
             return False
     except IOError:
@@ -222,6 +237,44 @@ def find_anchors_match(search_lines, file_lines):
     return [{'start': start_idx, 'end': end_idx, 'ratio': 0.95}]
 
 
+def find_fuzzy_small_block(search_lines, file_lines, threshold=0.85):
+    s_clean = search_lines[:]
+    leading = 0
+    while s_clean and not s_clean[0].strip():
+        s_clean.pop(0)
+        leading += 1
+    trailing = 0
+    while s_clean and not s_clean[-1].strip():
+        s_clean.pop()
+        trailing += 1
+
+    if not s_clean:
+        return []
+
+    s_norm = [normalize_str(l) for l in s_clean]
+    f_norm = [normalize_str(l) for l in file_lines]
+
+    n_s = len(s_norm)
+    n_f = len(f_norm)
+
+    if n_s == 0 or n_f < n_s:
+        return []
+
+    candidates = []
+    s_text = "\n".join(s_norm)
+
+    for i in range(n_f - n_s + 1):
+        window = f_norm[i:i+n_s]
+        w_text = "\n".join(window)
+        ratio = difflib.SequenceMatcher(None, s_text, w_text).ratio()
+        if ratio >= threshold:
+            actual_start = max(0, i - leading)
+            actual_end = min(len(file_lines), i + n_s + trailing)
+            candidates.append({'start': actual_start, 'end': actual_end, 'ratio': ratio * 0.98})
+
+    return candidates
+
+
 def find_matches(search_lines, file_lines):
     matches = []
     n_s = len(search_lines)
@@ -256,7 +309,7 @@ def main(ignore_folders=None, ignore_files=None):
     file_contents = {}
     file_encodings = {}
     for f in files:
-        for enc in ['utf-8', 'utf-8-sig', 'cp1251', 'latin-1']:
+        for enc in ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16le', 'utf-16be', 'cp1251', 'latin-1']:
             try:
                 with open(f, 'r', encoding=enc) as fp:
                     file_contents[f] = fp.read().splitlines()
@@ -289,13 +342,24 @@ def main(ignore_folders=None, ignore_files=None):
 
             # Если точного совпадения нет, используем якорный поиск
             file_candidates = find_anchors_match(search_lines, lines)
-            for cand in file_candidates:
-                candidates.append({
-                    'path': path,
-                    'start': cand['start'],
-                    'end': cand['end'],
-                    'ratio': cand['ratio']
-                })
+            if file_candidates:
+                for cand in file_candidates:
+                    candidates.append({
+                        'path': path,
+                        'start': cand['start'],
+                        'end': cand['end'],
+                        'ratio': cand['ratio']
+                    })
+            else:
+                s_clean_len = len([l for l in search_lines if l.strip()])
+                if 0 < s_clean_len < 4:
+                    for cand in find_fuzzy_small_block(search_lines, lines):
+                        candidates.append({
+                            'path': path,
+                            'start': cand['start'],
+                            'end': cand['end'],
+                            'ratio': cand['ratio']
+                        })
 
         # Сортировка по совпадению (сначала наиболее похожие)
         candidates.sort(key=lambda x: x['ratio'], reverse=True)
@@ -497,6 +561,19 @@ def main(ignore_folders=None, ignore_files=None):
         temp_path = path + ".tmp"
         try:
             enc = file_encodings.get(path, 'utf-8')
+            if 'utf-16' in enc.lower():
+                print(f"\n{Colors.YELLOW}Файл {path} обнаружен в кодировке {enc}.{Colors.RESET}")
+                try:
+                    ans = input("Разрешить внесение правок и перезаписать в UTF-8? (y/n): ").strip().lower()
+                except EOFError:
+                    ans = 'n'
+                if ans in ['y', 'yes', 'да', '1']:
+                    enc = 'utf-8'
+                    print(f"{Colors.GREEN}Кодировка файла {path} изменена на UTF-8 при сохранении.{Colors.RESET}")
+                else:
+                    print(f"{Colors.RED}Правки для файла {path} отменены.{Colors.RESET}")
+                    continue
+
             with open(temp_path, 'w', encoding=enc) as f:
                 f.write("\n".join(lines) + "\n")
             if os.path.exists(path):

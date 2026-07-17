@@ -1,6 +1,8 @@
 import re
 import sys
 import os
+import subprocess
+import tempfile
 
 
 # Константы для оформления вывода в консоль
@@ -55,8 +57,6 @@ def parse_input():
                 state = 1
                 current_search = []
                 current_replace = []
-            elif stripped and not stripped.startswith('#') and stripped != '.,,,':
-                print(f"{Colors.RED}Предупреждение: игнорируется текст вне блоков (строка {line_idx + 1}): {stripped[:50]}...{Colors.RESET}")
         elif state == 1:
             if is_mid:
                 state = 2
@@ -86,7 +86,7 @@ def parse_input():
             else:
                 current_replace.append(line.rstrip('\r\n'))
 
-    return blocks
+    return blocks, lines
 
 
 import difflib
@@ -95,20 +95,14 @@ def is_binary_file(filepath):
     try:
         with open(filepath, 'rb') as f:
             chunk = f.read(1024)
-            if chunk.startswith(b'\xff\xfe') or chunk.startswith(b'\xfe\xff'):
+            # Проверка стандартных BOM для текста
+            if chunk.startswith(b'\xff\xfe') or chunk.startswith(b'\xfe\xff') or chunk.startswith(b'\xef\xbb\xbf'):
                 return False
+            # Проверка сигнатуры SQLite
+            if chunk.startswith(b'SQLite format 3\x00'):
+                return True
+            # Общая проверка на нулевые байты (бинарники)
             if b'\x00' in chunk:
-                test_len = min(len(chunk), 100)
-                if test_len % 2 != 0:
-                    test_len -= 1
-                test_chunk = chunk[:test_len]
-                if test_chunk:
-                    for enc in ['utf-16', 'utf-16le', 'utf-16be']:
-                        try:
-                            test_chunk.decode(enc)
-                            return False
-                        except UnicodeDecodeError:
-                            pass
                 return True
             return False
     except IOError:
@@ -295,11 +289,86 @@ def find_matches(search_lines, file_lines):
     return matches
 
 
+def extract_powershell_commands(lines):
+    commands = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+
+        # 1. Поиск блоков powershell в markdown
+        if stripped.lower() in ["```powershell", "```ps1", "```ps"]:
+            start = i + 1
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                i += 1
+            if i < len(lines):
+                cmd = "".join(lines[start:i])
+                if cmd.strip():
+                    commands.append(cmd)
+
+        # 2. Поиск блоков $content = @'
+        elif stripped.startswith("$content = @'") or stripped.startswith('$content=@\''):
+            start = i
+            while i < len(lines) and "Out-File" not in lines[i]:
+                i += 1
+            if i < len(lines):
+                cmd = "".join(lines[start:i+1])
+                commands.append(cmd)
+        i += 1
+
+    return commands
+
+
+def execute_powershell(script):
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False, encoding='utf-8-sig') as f:
+            f.write(script)
+            temp_path = f.name
+
+        process = subprocess.Popen(["powershell", "-ExecutionPolicy", "Bypass", "-NoProfile", "-NonInteractive", "-File", temp_path],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
+        stdout, stderr = process.communicate()
+        if stdout:
+            print(stdout)
+        if stderr:
+            print(f"{Colors.YELLOW}Вывод PowerShell:\n{stderr}{Colors.RESET}")
+        if process.returncode == 0:
+            print(f"{Colors.GREEN}Скрипт успешно выполнен.{Colors.RESET}")
+        else:
+            print(f"{Colors.RED}Скрипт завершился с кодом {process.returncode}.{Colors.RESET}")
+
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+    except Exception as e:
+        print(f"{Colors.RED}Ошибка запуска PowerShell: {e}{Colors.RESET}")
+
+
 def main(ignore_folders=None, ignore_files=None):
-    blocks = parse_input()
+    blocks, input_lines = parse_input()
+
+    ps_commands = extract_powershell_commands(input_lines)
+    if ps_commands:
+        print(f"\n{Colors.YELLOW}Обнаружены команды PowerShell ({len(ps_commands)} шт.):{Colors.RESET}")
+        for idx, cmd in enumerate(ps_commands, 1):
+            print(f"{Colors.YELLOW}--- Скрипт {idx} ---{Colors.RESET}")
+            print(cmd.strip()[:500] + ("..." if len(cmd.strip()) > 500 else ""))
+            print(f"{Colors.YELLOW}-------------------{Colors.RESET}")
+
+        try:
+            ans = input("Выполнить команды PowerShell? (y/n): ").strip().lower()
+        except EOFError:
+            ans = 'n'
+
+        if ans in ['y', 'yes', 'да', '1']:
+            for idx, cmd in enumerate(ps_commands, 1):
+                print(f"\n{Colors.YELLOW}Выполнение скрипта {idx}...{Colors.RESET}")
+                execute_powershell(cmd)
 
     if not blocks:
-        print(f"{Colors.RED}Не найдено ни одного корректного блока с маркерами <<<< ==== >>>>!{Colors.RESET}")
+        if not ps_commands:
+            print(f"{Colors.RED}Не найдено ни одного корректного блока с маркерами <<<< ==== >>>>!{Colors.RESET}")
         return
 
     print(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
@@ -315,7 +384,7 @@ def main(ignore_folders=None, ignore_files=None):
                     file_contents[f] = fp.read().splitlines()
                 file_encodings[f] = enc
                 break
-            except (UnicodeDecodeError, LookupError):
+            except (UnicodeError, LookupError, ValueError):
                 pass
 
     # 2. Поиск совпадений

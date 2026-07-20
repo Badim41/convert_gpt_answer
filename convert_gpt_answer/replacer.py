@@ -3,6 +3,9 @@ import sys
 import os
 import subprocess
 import tempfile
+import time
+
+COUNT_TIME = True
 
 
 # Константы для оформления вывода в консоль
@@ -423,6 +426,8 @@ def main(ignore_folders=None, ignore_files=None):
             print(f"{Colors.RED}Не найдено ни одного корректного блока с маркерами <<<< ==== >>>>!{Colors.RESET}")
         return
 
+    start_time = time.time()
+
     print(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
 
     # 1. Чтение всех файлов с автоопределением кодировки
@@ -644,6 +649,10 @@ def main(ignore_folders=None, ignore_files=None):
         for err in errors:
             print(f"{Colors.RED}{err}{Colors.RESET}")
             print(f"{Colors.YELLOW}{'-' * 60}{Colors.RESET}")
+
+        elapsed = time.time() - start_time
+        if COUNT_TIME and elapsed > 5:
+            print(f"\n{Colors.YELLOW}Время выполнения: {elapsed:.2f} сек.{Colors.RESET}")
         return False
 
     # 4. Применение правок
@@ -733,6 +742,10 @@ def main(ignore_folders=None, ignore_files=None):
                 except OSError:
                     pass
             print(f"{Colors.RED}Ошибка при записи файла {path}: {e}{Colors.RESET}")
+
+            elapsed = time.time() - start_time
+            if COUNT_TIME and elapsed > 5:
+                print(f"\n{Colors.YELLOW}Время выполнения: {elapsed:.2f} сек.{Colors.RESET}")
             return False
 
         print(f"Обновлен файл: {Colors.YELLOW}{path}{Colors.RESET}")
@@ -743,6 +756,11 @@ def main(ignore_folders=None, ignore_files=None):
     print(f"Всего обработано блоков: {len(blocks)}")
     print(f"Изменено файлов: {files_changed}")
     print(f"{'=' * 60}{Colors.RESET}")
+
+    elapsed = time.time() - start_time
+    if COUNT_TIME and elapsed > 5:
+        print(f"{Colors.YELLOW}Время выполнения: {elapsed:.2f} сек.{Colors.RESET}")
+
     return True
 
 

@@ -1,4 +1,4 @@
-import re
+﻿import re
 import sys
 import os
 import subprocess
@@ -18,6 +18,12 @@ IGNORE_DIRS = {
     '.git', 'node_modules', 'venv', '.venv', 'env',
     '__pycache__', '.idea', '.vscode', 'build', 'dist',
     'coverage', '.next', '.nuxt', 'out'
+}
+
+CODE_EXTENSIONS = {
+    '.py', '.js', '.jsx', '.ts', '.tsx', '.vue', '.html', '.css', '.scss',
+    '.json', '.yml', '.yaml', '.md', '.sh', '.bash', '.ps1', '.bat', '.cmd',
+    '.php', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.rs', '.sql'
 }
 
 
@@ -231,7 +237,7 @@ def find_anchors_match(search_lines, file_lines):
     return [{'start': start_idx, 'end': end_idx, 'ratio': 0.95}]
 
 
-def find_fuzzy_small_block(search_lines, file_lines, threshold=0.85):
+def find_fuzzy_block(search_lines, file_lines, threshold=0.85):
     s_clean = search_lines[:]
     leading = 0
     while s_clean and not s_clean[0].strip():
@@ -251,11 +257,19 @@ def find_fuzzy_small_block(search_lines, file_lines, threshold=0.85):
     n_s = len(s_norm)
     n_f = len(f_norm)
 
-    if n_s == 0 or n_f < n_s:
+    if n_s == 0:
         return []
 
     candidates = []
     s_text = "\n".join(s_norm)
+
+    # Если файл меньше искомого блока, просто сравниваем их целиком
+    if n_f < n_s:
+        f_text = "\n".join(f_norm)
+        ratio = difflib.SequenceMatcher(None, s_text, f_text).ratio()
+        if ratio >= threshold:
+            candidates.append({'start': 0, 'end': len(file_lines), 'ratio': ratio * 0.98})
+        return candidates
 
     for i in range(n_f - n_s + 1):
         window = f_norm[i:i+n_s]
@@ -378,7 +392,8 @@ def main(ignore_folders=None, ignore_files=None):
     file_contents = {}
     file_encodings = {}
     for f in files:
-        for enc in ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16le', 'utf-16be', 'cp1251', 'latin-1']:
+        # utf-8-sig идет первым, чтобы корректно отсекать невидимые BOM-символы в начале файла
+        for enc in ['utf-8-sig', 'utf-8', 'utf-16', 'utf-16le', 'utf-16be', 'cp1251', 'latin-1']:
             try:
                 with open(f, 'r', encoding=enc) as fp:
                     file_contents[f] = fp.read().splitlines()
@@ -390,45 +405,46 @@ def main(ignore_folders=None, ignore_files=None):
     # 2. Поиск совпадений
     block_matches = []
     already_applied_blocks = {}
+
+    code_file_contents = {p: l for p, l in file_contents.items() if os.path.splitext(p)[1].lower() in CODE_EXTENSIONS or not os.path.splitext(p)[1]}
+    other_file_contents = {p: l for p, l in file_contents.items() if p not in code_file_contents}
+
+    def get_candidates(search_lines, target_files):
+        cands = []
+        for path, lines in target_files.items():
+            exact_matches = find_matches(search_lines, lines)
+            if exact_matches:
+                for m in exact_matches:
+                    cands.append({'path': path, 'start': m[0], 'end': m[1], 'ratio': 1.0})
+                continue
+
+            file_candidates = find_anchors_match(search_lines, lines)
+            if file_candidates:
+                for cand in file_candidates:
+                    cands.append({'path': path, 'start': cand['start'], 'end': cand['end'], 'ratio': cand['ratio']})
+            else:
+                s_clean_len = len([l for l in search_lines if l.strip()])
+                if s_clean_len > 0:
+                    for cand in find_fuzzy_block(search_lines, lines):
+                        cands.append({'path': path, 'start': cand['start'], 'end': cand['end'], 'ratio': cand['ratio']})
+        return cands
+
     for idx, block in enumerate(blocks):
         search_lines = block['search']
         matches_for_block = []
 
-        # Поиск потенциальных кандидатов во всех файлах
-        candidates = []
-        for path, lines in file_contents.items():
-            # Шаг 1: Проверка полного точного совпадения
-            exact_matches = find_matches(search_lines, lines)
-            if exact_matches:
-                for m in exact_matches:
-                    candidates.append({
-                        'path': path,
-                        'start': m[0],
-                        'end': m[1],
-                        'ratio': 1.0
-                    })
-                continue
+        # Поиск потенциальных кандидатов сначала в файлах кода
+        candidates = get_candidates(search_lines, code_file_contents)
 
-            # Если точного совпадения нет, используем якорный поиск
-            file_candidates = find_anchors_match(search_lines, lines)
-            if file_candidates:
-                for cand in file_candidates:
-                    candidates.append({
-                        'path': path,
-                        'start': cand['start'],
-                        'end': cand['end'],
-                        'ratio': cand['ratio']
-                    })
-            else:
-                s_clean_len = len([l for l in search_lines if l.strip()])
-                if 0 < s_clean_len < 4:
-                    for cand in find_fuzzy_small_block(search_lines, lines):
-                        candidates.append({
-                            'path': path,
-                            'start': cand['start'],
-                            'end': cand['end'],
-                            'ratio': cand['ratio']
-                        })
+        if not candidates and other_file_contents:
+            print(f"\n{Colors.YELLOW}Блок {idx + 1} не найден в файлах кода.{Colors.RESET}")
+            try:
+                ans = input("Искать в остальных файлах (базы данных, логи и т.д.)? (y/n для отмены поиска блока): ").strip().lower()
+            except EOFError:
+                ans = 'n'
+
+            if ans in ['y', 'yes', 'да', '1']:
+                candidates = get_candidates(search_lines, other_file_contents)
 
         # Сортировка по совпадению (сначала наиболее похожие)
         candidates.sort(key=lambda x: x['ratio'], reverse=True)

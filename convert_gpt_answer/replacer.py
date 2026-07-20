@@ -434,16 +434,22 @@ def main(ignore_folders=None, ignore_files=None):
     files = get_all_text_files(ignore_folders=ignore_folders, ignore_files=ignore_files, prompt_filenames=prompt_filenames)
     file_contents = {}
     file_encodings = {}
+    non_utf8_files = []
+
     for f in files:
-        # utf-8-sig идет первым, чтобы корректно отсекать невидимые BOM-символы в начале файла
-        for enc in ['utf-8-sig', 'utf-8', 'utf-16', 'utf-16le', 'utf-16be', 'cp1251', 'latin-1']:
+        # Сначала пробуем только UTF-8 (utf-8-sig корректно отсекает BOM)
+        is_read = False
+        for enc in ['utf-8-sig', 'utf-8']:
             try:
                 with open(f, 'r', encoding=enc) as fp:
                     file_contents[f] = fp.read().splitlines()
                 file_encodings[f] = enc
+                is_read = True
                 break
             except (UnicodeError, LookupError, ValueError):
                 pass
+        if not is_read:
+            non_utf8_files.append(f)
 
     # 2. Поиск совпадений
     block_matches = []
@@ -466,15 +472,35 @@ def main(ignore_folders=None, ignore_files=None):
             if path != last_found_path:
                 search_order.append(path)
 
-        # Быстрый фильтр: ищем самое длинное слово из искомого блока
+        # Быстрый фильтр: ищем по первым строкам и самому длинному слову
+        search_lines_clean = [l.strip() for l in search_lines if l.strip()]
+        # Берем до 3 первых непустых строк (длиной от 4 символов) для надежности
+        check_lines = ["".join(l.split()) for l in search_lines_clean[:3] if len(l.strip()) > 3]
+        if not check_lines and search_lines_clean:
+            check_lines = ["".join(search_lines_clean[0].split())]
+
         words = re.findall(r'\w+', "\n".join(search_lines))
         longest_word = max(words, key=len) if words else ""
 
         for path in search_order:
             lines = target_files[path]
 
-            if len(longest_word) > 8 and longest_word not in "\n".join(lines):
-                continue
+            # 1. Проверка по самому длинному слову (очень быстрая, без склеивания файла)
+            if len(longest_word) > 8:
+                if not any(longest_word in l for l in lines):
+                    continue
+
+            # 2. Проверка по первым строкам (игнорируя пробелы)
+            if check_lines:
+                match_found = False
+                for l in lines:
+                    l_norm = "".join(l.split())
+                    # Если хотя бы одна из первых строк блока есть в строке файла
+                    if any(c_line in l_norm for c_line in check_lines):
+                        match_found = True
+                        break
+                if not match_found:
+                    continue
 
             exact_matches = find_matches(search_lines, lines)
             if exact_matches:
@@ -509,6 +535,31 @@ def main(ignore_folders=None, ignore_files=None):
 
             if ans in ['y', 'yes', 'да', '1']:
                 candidates = get_candidates(search_lines, other_file_contents)
+
+        if not candidates and non_utf8_files:
+            print(f"\n{Colors.YELLOW}Блок {idx + 1} не найден в текущих файлах. Подгрузка файлов с другими кодировками...{Colors.RESET}")
+            newly_read = {}
+            for f in list(non_utf8_files):
+                for enc in ['utf-16', 'utf-16le', 'utf-16be', 'cp1251', 'latin-1']:
+                    try:
+                        with open(f, 'r', encoding=enc) as fp:
+                            lines = fp.read().splitlines()
+                        file_contents[f] = lines
+                        file_encodings[f] = enc
+                        newly_read[f] = lines
+                        non_utf8_files.remove(f)
+
+                        # Распределяем файлы по категориям для будущих блоков
+                        if os.path.splitext(f)[1].lower() in CODE_EXTENSIONS or not os.path.splitext(f)[1]:
+                            code_file_contents[f] = lines
+                        else:
+                            other_file_contents[f] = lines
+                        break
+                    except (UnicodeError, LookupError, ValueError):
+                        pass
+
+            if newly_read:
+                candidates = get_candidates(search_lines, newly_read)
 
         # Сортировка по совпадению (сначала наиболее похожие)
         candidates.sort(key=lambda x: x['ratio'], reverse=True)
@@ -716,6 +767,8 @@ def main(ignore_folders=None, ignore_files=None):
         temp_path = path + ".tmp"
         try:
             enc = file_encodings.get(path, 'utf-8')
+            if enc.lower() == 'utf-8-sig':
+                enc = 'utf-8'
             if 'utf-16' in enc.lower():
                 print(f"\n{Colors.YELLOW}Файл {path} обнаружен в кодировке {enc}.{Colors.RESET}")
                 try:

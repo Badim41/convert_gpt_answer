@@ -27,6 +27,18 @@ CODE_EXTENSIONS = {
 }
 
 
+def extract_filenames_from_prompt(lines):
+    filenames = set()
+    pattern = re.compile(r'([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]{2,10})')
+    for line in lines:
+        if line.startswith('<<<<'):
+            continue
+        for match in pattern.findall(line):
+            if "/" in match or "\\" in match or "." in match:
+                filenames.add(os.path.basename(match))
+    return filenames
+
+
 def parse_input():
     print(f"{Colors.YELLOW}Введите текст с блоками правок. {Colors.RESET}")
     print(
@@ -115,13 +127,15 @@ def is_binary_file(filepath):
         return True
 
 
-def get_all_text_files(root_dir='.', ignore_folders=None, ignore_files=None):
-    text_files = []
+def get_all_text_files(root_dir='.', ignore_folders=None, ignore_files=None, prompt_filenames=None):
     folders_to_ignore = set(IGNORE_DIRS)
     if ignore_folders:
         folders_to_ignore.update(ignore_folders)
 
     files_to_ignore = set(ignore_files) if ignore_files else set()
+    prompt_filenames = prompt_filenames or set()
+
+    file_stats = []
 
     for dirpath, dirnames, filenames in os.walk(root_dir):
         dirnames[:] = [d for d in dirnames if d not in folders_to_ignore]
@@ -129,14 +143,37 @@ def get_all_text_files(root_dir='.', ignore_folders=None, ignore_files=None):
         for file in filenames:
             if file in files_to_ignore:
                 continue
+
             file_path = os.path.join(dirpath, file)
-            if not is_binary_file(file_path):
-                text_files.append(file_path)
+
+            try:
+                size = os.path.getsize(file_path)
+                if size > 5 * 1024 * 1024:  # Пропускаем файлы больше 5 МБ
+                    continue
+                mtime = os.path.getmtime(file_path)
+            except OSError:
+                continue
+
+            priority = 100 if file in prompt_filenames else 0
+            file_stats.append({
+                'path': file_path,
+                'size': size,
+                'mtime': mtime,
+                'priority': priority
+            })
+
+    # Сортировка: 1. Из промпта 2. Недавно измененные (mtime убывает) 3. Меньшего размера (size возрастает)
+    file_stats.sort(key=lambda x: (-x['priority'], -x['mtime'], x['size']))
+
+    text_files = []
+    for item in file_stats:
+        if not is_binary_file(item['path']):
+            text_files.append(item['path'])
     return text_files
 
 
 def normalize_str(s):
-    return re.sub(r'\s+', ' ', s.strip())
+    return ' '.join(s.split())
 
 
 def compute_mismatch_stats(search_lines, candidate_lines):
@@ -361,6 +398,7 @@ def execute_powershell(script):
 
 def main(ignore_folders=None, ignore_files=None):
     blocks, input_lines = parse_input()
+    prompt_filenames = extract_filenames_from_prompt(input_lines)
 
     ps_commands = extract_powershell_commands(input_lines)
     if ps_commands:
@@ -388,7 +426,7 @@ def main(ignore_folders=None, ignore_files=None):
     print(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
 
     # 1. Чтение всех файлов с автоопределением кодировки
-    files = get_all_text_files(ignore_folders=ignore_folders, ignore_files=ignore_files)
+    files = get_all_text_files(ignore_folders=ignore_folders, ignore_files=ignore_files, prompt_filenames=prompt_filenames)
     file_contents = {}
     file_encodings = {}
     for f in files:
@@ -409,9 +447,30 @@ def main(ignore_folders=None, ignore_files=None):
     code_file_contents = {p: l for p, l in file_contents.items() if os.path.splitext(p)[1].lower() in CODE_EXTENSIONS or not os.path.splitext(p)[1]}
     other_file_contents = {p: l for p, l in file_contents.items() if p not in code_file_contents}
 
+    last_found_path = None
+
     def get_candidates(search_lines, target_files):
         cands = []
-        for path, lines in target_files.items():
+
+        # Сначала проверяем файл, в котором была предыдущая правка (Пространственная локальность)
+        search_order = []
+        if last_found_path and last_found_path in target_files:
+            search_order.append(last_found_path)
+
+        for path in target_files:
+            if path != last_found_path:
+                search_order.append(path)
+
+        # Быстрый фильтр: ищем самое длинное слово из искомого блока
+        words = re.findall(r'\w+', "\n".join(search_lines))
+        longest_word = max(words, key=len) if words else ""
+
+        for path in search_order:
+            lines = target_files[path]
+
+            if len(longest_word) > 8 and longest_word not in "\n".join(lines):
+                continue
+
             exact_matches = find_matches(search_lines, lines)
             if exact_matches:
                 for m in exact_matches:
@@ -454,6 +513,7 @@ def main(ignore_folders=None, ignore_files=None):
         if exact_candidates:
             for ec in exact_candidates:
                 matches_for_block.append((ec['path'], ec['start'], ec['end']))
+                last_found_path = ec['path']
         else:
             # Иначе запрашиваем подтверждение для лучших нечетких совпадений
             for cand in candidates:
@@ -512,6 +572,7 @@ def main(ignore_folders=None, ignore_files=None):
 
                 if ans in ['y', 'yes', 'да', '1']:
                     matches_for_block.append((path, start, end))
+                    last_found_path = path
                     break
 
         if not matches_for_block:

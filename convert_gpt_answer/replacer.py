@@ -1,4 +1,4 @@
-import re
+﻿import re
 import sys
 import os
 import subprocess
@@ -452,9 +452,16 @@ def main(ignore_folders=None, ignore_files=None):
     non_utf8_files = []
 
     for f in files:
-        # Сначала пробуем только UTF-8 (utf-8-sig корректно отсекает BOM)
         is_read = False
-        for enc in ['utf-8-sig', 'utf-8']:
+        try:
+            with open(f, 'rb') as fp:
+                has_bom = fp.read(3) == b'\xef\xbb\xbf'
+        except Exception:
+            has_bom = False
+
+        # Если есть BOM, используем utf-8-sig, иначе обычный utf-8
+        encodings = ['utf-8-sig'] if has_bom else ['utf-8']
+        for enc in encodings:
             try:
                 with open(f, 'r', encoding=enc, newline='') as fp:
                     content = fp.read()
@@ -465,6 +472,7 @@ def main(ignore_folders=None, ignore_files=None):
                 break
             except (UnicodeError, LookupError, ValueError):
                 pass
+
         if not is_read:
             non_utf8_files.append(f)
 
@@ -743,7 +751,12 @@ def main(ignore_folders=None, ignore_files=None):
                     relative_indent_str = r_indent_str[len(s_base_str):]
                     new_line = f_base_str + relative_indent_str + r_line.lstrip()
                 else:
-                    new_line = f_base_str + r_line.lstrip()
+                    diff = len(r_indent_str) - len(s_base_str)
+                    if diff < 0:
+                        keep_len = max(0, len(f_base_str) + diff)
+                        new_line = f_base_str[:keep_len] + r_line.lstrip()
+                    else:
+                        new_line = f_base_str + r_line.lstrip()
 
                 # Если строка была пустой (только пробелы), убираем лишнее, оставляя только отступ
                 if not r_line.strip():

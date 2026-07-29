@@ -515,57 +515,6 @@ def get_fuzzy_ratio(s1, s2):
     return difflib.SequenceMatcher(None, s1, s2).ratio()
 
 
-def detect_indent_style(lines):
-    indents = []
-    has_tabs = False
-    for line in lines:
-        if not line.strip():
-            continue
-        if line.startswith('\t'):
-            has_tabs = True
-        indents.append(len(line) - len(line.lstrip()))
-
-    if has_tabs:
-        return ('tab', 1)
-
-    diffs = {}
-    for i in range(1, len(indents)):
-        diff = abs(indents[i] - indents[i - 1])
-        if diff > 0:
-            diffs[diff] = diffs.get(diff, 0) + 1
-
-    if not diffs:
-        return ('space', 4)  # Fallback
-
-    most_common_diff = max(diffs.items(), key=lambda x: x[1])[0]
-    return ('space', most_common_diff)
-
-def adapt_indentation(replace_lines, source_style, target_style):
-    if source_style == target_style:
-        return replace_lines
-
-    s_type, s_size = source_style
-    t_type, t_size = target_style
-
-    adapted = []
-    for line in replace_lines:
-        if not line.strip():
-            adapted.append(line)
-            continue
-
-        indent_len = len(line) - len(line.lstrip())
-        if indent_len == 0:
-            adapted.append(line)
-            continue
-
-        levels = indent_len / s_size if s_type == 'space' else indent_len
-        levels = int(round(levels))
-
-        new_indent = ('\t' * levels) if t_type == 'tab' else (' ' * (levels * t_size))
-        adapted.append(new_indent + line.lstrip())
-
-    return adapted
-
 def compute_mismatch_stats(search_lines, candidate_lines):
     search_text = "\n".join(l.strip() for l in search_lines)
     cand_text = "\n".join(l.strip() for l in candidate_lines)
@@ -892,7 +841,9 @@ def main(ignore_folders=None, ignore_files=None):
             print("Auto-mode: PowerShell скрипт выполняется автоматически.")
         else:
             try:
-                ans = input("Выполнить команды PowerShell? (y/n): ").strip().lower()
+                ans = input("Выполнить команды PowerShell? [y/n] (Enter=y): ").strip().lower()
+                if not ans:
+                    ans = 'y'
             except EOFError:
                 ans = 'n'
 
@@ -975,7 +926,9 @@ def main(ignore_folders=None, ignore_files=None):
             ans = 'y' if AUTO_MODE else 'n'
             if not AUTO_MODE:
                 try:
-                    ans = input("Искать в остальных файлах (базы данных, логи и т.д.)? (y/n для отмены поиска блока): ").strip().lower()
+                    ans = input("Искать в остальных файлах (базы данных, логи и т.д.)? [y/n] (Enter=y): ").strip().lower()
+                    if not ans:
+                        ans = 'y'
                 except EOFError:
                     ans = 'n'
 
@@ -1080,7 +1033,9 @@ def main(ignore_folders=None, ignore_files=None):
                     print(f"{Colors.GREEN}Сходство 100% (с учетом игнорирования отступов). Автоматическое подтверждение.{Colors.RESET}")
                 else:
                     try:
-                        ans = input("Подтвердить? y/n: ").strip().lower()
+                        ans = input("Подтвердить? [y/n] (Enter=y): ").strip().lower()
+                        if not ans:
+                            ans = 'y'
                     except EOFError:
                         ans = 'n'
 
@@ -1127,7 +1082,9 @@ def main(ignore_folders=None, ignore_files=None):
                     print(f"\n{Colors.YELLOW}ВНИМАНИЕ: Для блока {idx + 1} оригинал не найден, но точная копия текста ЗАМЕНЫ уже присутствует в коде:{Colors.RESET}")
                     print(f"  - {locs_str}")
                     try:
-                        ans = input("Похоже, правки уже внесены. Пропустить этот блок? (y/n): ").strip().lower()
+                        ans = input("Похоже, правки уже внесены. Пропустить этот блок? [y/n] (Enter=y): ").strip().lower()
+                        if not ans:
+                            ans = 'y'
                     except EOFError:
                         ans = 'n'
                     if ans in ['y', 'yes', 'да', '1']:
@@ -1148,7 +1105,9 @@ def main(ignore_folders=None, ignore_files=None):
                 print("Auto-mode: применяем только к первому совпадению.")
             else:
                 try:
-                    ans = input("Применить ко всем? (y - ко всем, 1 - только к первому, s - пропустить): ").strip().lower()
+                    ans = input("Применить ко всем? (y - ко всем, 1 - только к первому, s - пропустить) [Enter=y]: ").strip().lower()
+                    if not ans:
+                        ans = 'y'
                 except EOFError:
                     ans = 's'
 
@@ -1210,59 +1169,9 @@ def main(ignore_folders=None, ignore_files=None):
         for mod in mods:
             start = mod['start']
             end = mod['end']
-            search_lines = mod['search']
             replace_lines = mod['replace']
 
-            target_style = detect_indent_style(lines)
-            source_style = detect_indent_style(replace_lines)
-
-            f_base_str = ""
-            for j in range(min(len(search_lines), len(lines) - start)):
-                if search_lines[j].strip() and lines[start + j].strip():
-                    f_line = lines[start + j]
-                    f_base_str = f_line[:len(f_line) - len(f_line.lstrip())]
-                    break
-
-            r_base_str = ""
-            for r_line in replace_lines:
-                if r_line.strip():
-                    r_base_str = r_line[:len(r_line) - len(r_line.lstrip())]
-                    break
-
-            s_type, s_size = source_style
-            t_type, t_size = target_style
-
-            new_lines = []
-            for r_line in replace_lines:
-                if not r_line.strip():
-                    new_lines.append("")
-                    continue
-
-                r_indent_str = r_line[:len(r_line) - len(r_line.lstrip())]
-
-                # Вычисляем относительный отступ от базового (r_base_str)
-                if r_indent_str.startswith(r_base_str):
-                    relative_indent_len = len(r_indent_str) - len(r_base_str)
-                else:
-                    relative_indent_len = 0 # Fallback, если строка оказалась левее базы
-
-                # Конвертируем относительный отступ под целевой стиль
-                if s_type == 'space':
-                    levels = relative_indent_len / s_size
-                else:
-                    levels = relative_indent_len
-
-                levels = max(0, int(round(levels)))
-
-                if t_type == 'tab':
-                    scaled_relative_indent = '\t' * levels
-                else:
-                    scaled_relative_indent = ' ' * (levels * t_size)
-
-                new_line = f_base_str + scaled_relative_indent + r_line.lstrip()
-                new_lines.append(new_line.rstrip('\n\r'))
-
-            lines = lines[:start] + new_lines + lines[end:]
+            lines = lines[:start] + replace_lines + lines[end:]
 
         # Запись во временный словарь (в памяти)
         try:
@@ -1277,7 +1186,9 @@ def main(ignore_folders=None, ignore_files=None):
                 ans = 'y' if AUTO_MODE else 'n'
                 if not AUTO_MODE:
                     try:
-                        ans = input("Разрешить внесение правок и перезаписать в UTF-8? (y/n): ").strip().lower()
+                        ans = input("Разрешить внесение правок и перезаписать в UTF-8? [y/n] (Enter=y): ").strip().lower()
+                        if not ans:
+                            ans = 'y'
                     except EOFError:
                         ans = 'n'
                 if ans in ['y', 'yes', 'да', '1']:
@@ -1303,14 +1214,32 @@ def main(ignore_folders=None, ignore_files=None):
         print(f"{Colors.RED}Ошибка создания резервной копии: {e}{Colors.RESET}")
         return False
 
+    # Проверка линтером перед записью (последовательно, чтобы можно было взаимодействовать с пользователем)
+    for d in pending_replacements:
+        path, lines, enc, newline_char = d
+        content = newline_char.join(lines) + newline_char
+        is_valid, err_msg = run_dry_linter(path, content)
+        if not is_valid:
+            print(f"\n{Colors.RED}Синтаксическая ошибка в файле {path}:{Colors.RESET}")
+            print(f"{Colors.YELLOW}{err_msg}{Colors.RESET}")
+            if AUTO_MODE:
+                ans = 'y'
+                print(f"{Colors.YELLOW}Auto-mode: Игнорируем синтаксическую ошибку.{Colors.RESET}")
+            else:
+                try:
+                    ans = input("Игнорировать ошибку и сохранить файл? [y/n] (Enter=y): ").strip().lower()
+                    if not ans:
+                        ans = 'y'
+                except EOFError:
+                    ans = 'n'
+            if ans not in ['y', 'yes', 'да', '1']:
+                print(f"{Colors.RED}Запись отменена пользователем. Выполняется откат...{Colors.RESET}")
+                tm.undo_last()
+                return False
+
     def safe_atomic_write(file_data):
         path, lines, enc, newline_char = file_data
         content = newline_char.join(lines) + newline_char
-
-        # Dry Run Linter: Проверка синтаксиса перед записью
-        is_valid, err_msg = run_dry_linter(path, content)
-        if not is_valid:
-            raise ValueError(f"Синтаксическая ошибка в файле {path}:\n  {err_msg}")
 
         # Атомарная запись через .tmp файл
         tmp_path = path + ".tmp_write"

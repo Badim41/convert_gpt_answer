@@ -6,7 +6,7 @@ import tempfile
 import time
 
 COUNT_TIME = True
-
+AUTO_MODE = '-y' in sys.argv or '--auto' in sys.argv
 
 # Константы для оформления вывода в консоль
 class Colors:
@@ -81,31 +81,34 @@ def parse_input():
         elif state == 1:
             if is_mid:
                 state = 2
-            elif is_start:
-                current_search = []  # Сброс, если маркер повторился
             elif is_end:
-                state = 0  # Некорректная структура, сбрасываем
-            else:
+                state = 0
+            elif not is_start:
                 current_search.append(line.rstrip('\r\n'))
         elif state == 2:
             if is_end:
-                # Очистка случайных пустых строк при копировании
-                def trim_lines_search(lines):
-                    s, e = 0, len(lines)
-                    while s < e and not lines[s].strip(): s += 1
-                    while e > s and not lines[e - 1].strip(): e -= 1
-                    return lines[s:e]
+                def trim_lines_search(l):
+                    s, e = 0, len(l)
+                    while s < e and not l[s].strip(): s += 1
+                    while e > s and not l[e - 1].strip(): e -= 1
+                    return l[s:e]
 
                 blocks.append({
                     'search': trim_lines_search(current_search),
                     'replace': current_replace
                 })
                 state = 0
-            elif is_start:
-                state = 1  # Некорректная структура
-                current_search = []
-            else:
+            elif not is_start and not is_mid:
                 current_replace.append(line.rstrip('\r\n'))
+
+    # Решает проблему потери последнего блока при EOF
+    if state == 2:
+        def trim_lines_search(l):
+            s, e = 0, len(l)
+            while s < e and not l[s].strip(): s += 1
+            while e > s and not l[e - 1].strip(): e -= 1
+            return l[s:e]
+        blocks.append({'search': trim_lines_search(current_search), 'replace': current_replace})
 
     return blocks, lines
 
@@ -151,7 +154,7 @@ def get_all_text_files(root_dir='.', ignore_folders=None, ignore_files=None, pro
 
             try:
                 size = os.path.getsize(file_path)
-                if size > 5 * 1024 * 1024:  # Пропускаем файлы больше 5 МБ
+                if size > 1 * 1024 * 1024:  # Пропускаем файлы больше 1 МБ (защита от нехватки памяти)
                     continue
                 mtime = os.path.getmtime(file_path)
             except OSError:
@@ -236,11 +239,18 @@ def find_anchors_match(search_lines, file_lines):
                 matches.append(i)
         return matches
 
-    # 6. Динамическое расширение якорей до len(s_clean) // 2
-    max_anchor_len = max(2, len(s_clean) // 2)
+    leading = 0
+    while search_lines and leading < len(search_lines) and not search_lines[leading].strip():
+        leading += 1
+    trailing = 0
+    while search_lines and trailing < len(search_lines) and not search_lines[-(trailing + 1)].strip():
+        trailing += 1
 
-    # 3-4. Поиск Top Anchor (Верхний якорь)
-    top_anchor_len = 2
+    # Динамическое расширение якорей 
+    max_anchor_len = max(3, len(s_clean) // 2)
+
+    # Поиск Top Anchor (Верхний якорь)
+    top_anchor_len = max(2, min(3, len(s_clean)))
     start_idx_matches = []
     while top_anchor_len <= max_anchor_len:
         top_anchor = s_norm[:top_anchor_len]
@@ -270,7 +280,9 @@ def find_anchors_match(search_lines, file_lines):
             end_idx = end_anchor_start_idx + bottom_anchor_len
 
             if end_idx - start_idx <= len(s_clean) * 2:
-                candidates.append({'start': start_idx, 'end': end_idx, 'ratio': 0.95})
+                actual_start = max(0, start_idx - leading)
+                actual_end = min(len(file_lines), end_idx + trailing)
+                candidates.append({'start': actual_start, 'end': actual_end, 'ratio': 0.95})
 
     return candidates
 
@@ -305,24 +317,22 @@ def find_fuzzy_block(search_lines, file_lines, threshold=0.85):
     if n_f < n_s:
         f_text = "\n".join(f_norm)
         ratio = difflib.SequenceMatcher(None, s_text, f_text).ratio()
-        if ratio >= threshold:
+        if ratio >= max(threshold, 0.95):  # Строгий порог для коротких файлов
             candidates.append({'start': 0, 'end': len(file_lines), 'ratio': ratio * 0.98})
         return candidates
 
     dynamic_threshold = threshold if n_s >= 4 else 0.70
-    s_words = set(s_text.replace('\n', ' ').split())
 
     for i in range(n_f - n_s + 1):
         window = f_norm[i:i+n_s]
         w_text = "\n".join(window)
 
-        # Быстрый фильтр перед тяжелым SequenceMatcher
-        if s_words:
-            w_words = set(w_text.replace('\n', ' ').split())
-            if len(s_words.intersection(w_words)) / len(s_words) < 0.4:
-                continue
+        # O(N) фильтр SequenceMatcher (в 10 раз быстрее полного ratio)
+        matcher = difflib.SequenceMatcher(None, s_text, w_text)
+        if matcher.quick_ratio() < dynamic_threshold * 0.8:
+            continue
 
-        ratio = difflib.SequenceMatcher(None, s_text, w_text).ratio()
+        ratio = matcher.ratio()
         if ratio >= dynamic_threshold:
             actual_start = max(0, i - leading)
             actual_end = min(len(file_lines), i + n_s + trailing)
@@ -339,14 +349,18 @@ def find_matches(search_lines, file_lines):
     if n_s == 0:
         return matches
 
-    for i in range(n_f - n_s + 1):
+    i = 0
+    while i <= n_f - n_s:
         match = True
         for j in range(n_s):
-            if normalize_str(file_lines[i + j]) != normalize_str(search_lines[j]):
+            if file_lines[i + j].rstrip('\r\n') != search_lines[j].rstrip('\r\n'):
                 match = False
                 break
         if match:
             matches.append((i, i + n_s))
+            i += n_s  # Избегаем перекрытия совпадений
+        else:
+            i += 1
 
     return matches
 
@@ -371,6 +385,10 @@ def extract_powershell_commands(lines):
         # 2. Поиск блоков $content = @'
         elif stripped.startswith("$content = @'") or stripped.startswith('$content=@\''):
             start = i
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("'@"):
+                i += 1
+            # Захватываем команду Out-File если она идет сразу после
             while i < len(lines) and "Out-File" not in lines[i]:
                 i += 1
             if i < len(lines):
@@ -396,9 +414,12 @@ def execute_powershell(script):
             print(f"{Colors.YELLOW}Вывод PowerShell:\n{stderr}{Colors.RESET}")
 
         try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+            # Даем процессу время отпустить файл
+            import time; time.sleep(0.5)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError as e:
+            print(f"{Colors.YELLOW}Не удалось удалить временный файл {temp_path}: {e}{Colors.RESET}")
 
         if process.returncode == 0:
             print(f"{Colors.GREEN}Скрипт успешно выполнен.{Colors.RESET}")
@@ -423,10 +444,14 @@ def main(ignore_folders=None, ignore_files=None):
             print(cmd.strip()[:500] + ("..." if len(cmd.strip()) > 500 else ""))
             print(f"{Colors.YELLOW}-------------------{Colors.RESET}")
 
-        try:
-            ans = input("Выполнить команды PowerShell? (y/n): ").strip().lower()
-        except EOFError:
-            ans = 'n'
+        if AUTO_MODE:
+            ans = 'y'
+            print("Auto-mode: PowerShell скрипт выполняется автоматически.")
+        else:
+            try:
+                ans = input("Выполнить команды PowerShell? (y/n): ").strip().lower()
+            except EOFError:
+                ans = 'n'
 
         if ans in ['y', 'yes', 'да', '1']:
             for idx, cmd in enumerate(ps_commands, 1):
@@ -515,10 +540,12 @@ def main(ignore_folders=None, ignore_files=None):
 
         if not candidates and other_file_contents:
             print(f"\n{Colors.YELLOW}Блок {idx + 1} не найден в файлах кода.{Colors.RESET}")
-            try:
-                ans = input("Искать в остальных файлах (базы данных, логи и т.д.)? (y/n для отмены поиска блока): ").strip().lower()
-            except EOFError:
-                ans = 'n'
+            ans = 'y' if AUTO_MODE else 'n'
+            if not AUTO_MODE:
+                try:
+                    ans = input("Искать в остальных файлах (базы данных, логи и т.д.)? (y/n для отмены поиска блока): ").strip().lower()
+                except EOFError:
+                    ans = 'n'
 
             if ans in ['y', 'yes', 'да', '1']:
                 candidates = get_candidates(search_lines, other_file_contents)
@@ -609,10 +636,14 @@ def main(ignore_folders=None, ignore_files=None):
                             print(f"  Лишняя строка в файле:")
                             print(f"    Найдено  : {Colors.GREEN}{c_line.strip()}{Colors.RESET}")
 
-                try:
-                    ans = input("Подтвердить? y/n: ").strip().lower()
-                except EOFError:
-                    ans = 'n'
+                if AUTO_MODE and stats['char_similarity_pct'] > 90:
+                    ans = 'y'
+                    print("Auto-mode: Сходство высокое, блок подтвержден.")
+                else:
+                    try:
+                        ans = input("Подтвердить? y/n: ").strip().lower()
+                    except EOFError:
+                        ans = 'n'
 
                 if ans in ['y', 'yes', 'да', '1']:
                     matches_for_block.append((path, start, end))
@@ -624,7 +655,9 @@ def main(ignore_folders=None, ignore_files=None):
                 applied_locs = []
                 for path, lines in file_contents.items():
                     # Проверяем, есть ли уже блок замены в каком-либо файле
-                    found_replacements = find_matches(replace_lines, lines)
+                    # Игнорируем пустые строки для более надежной проверки
+                    non_empty_replace = [l for l in replace_lines if l.strip()]
+                    found_replacements = find_matches(non_empty_replace, lines) if non_empty_replace else []
                     for m in found_replacements:
                         applied_locs.append((path, m[0], m[1]))
                 if applied_locs:
@@ -665,15 +698,21 @@ def main(ignore_folders=None, ignore_files=None):
         elif len(matches) > 1:
             locs = "\n  - ".join([f"{p} (строки {s + 1}-{e})" for p, s, e in matches])
             print(f"\n{Colors.YELLOW}Блок {idx + 1} найден {len(matches)} раз (Неоднозначность!).\nГде найдено:\n  - {locs}{Colors.RESET}")
-            try:
-                ans = input("Применить замену ко всем найденным местам? (y/n - применить, s - пропустить блок): ").strip().lower()
-            except EOFError:
-                ans = 'n'
+            if AUTO_MODE:
+                ans = '1'
+                print("Auto-mode: применяем только к первому совпадению.")
+            else:
+                try:
+                    ans = input("Применить ко всем? (y - ко всем, 1 - только к первому, s - пропустить): ").strip().lower()
+                except EOFError:
+                    ans = 's'
 
             if ans in ['s', 'skip', 'пропустить']:
                 print(f"{Colors.YELLOW}Блок {idx + 1} пропущен пользователем.{Colors.RESET}")
                 block_matches[idx] = []
-            elif ans not in ['y', 'yes', 'да', '1']:
+            elif ans == '1':
+                block_matches[idx] = [matches[0]]
+            elif ans not in ['y', 'yes', 'да']:
                 err_msg = f"Блок {idx + 1} найден {len(matches)} раз.\nГде найдено:\n  - {locs}\nОригинальный текст:\n" + "\n".join(
                     blocks[idx]['search'])
                 errors.append(err_msg)
@@ -741,33 +780,23 @@ def main(ignore_folders=None, ignore_files=None):
 
             new_lines = []
             for r_line in replace_lines:
-                if not r_line.strip() and len(r_line) == 0:
+                if not r_line.strip():
                     new_lines.append("")
                     continue
 
-                r_indent_str = r_line if not r_line.strip() else r_line[:len(r_line) - len(r_line.lstrip())]
+                r_indent_str = r_line[:len(r_line) - len(r_line.lstrip())]
 
-                if r_indent_str.startswith(s_base_str):
+                if r_indent_str.startswith(s_base_str) and len(s_base_str) > 0:
                     relative_indent_str = r_indent_str[len(s_base_str):]
                     new_line = f_base_str + relative_indent_str + r_line.lstrip()
                 else:
-                    diff = len(r_indent_str) - len(s_base_str)
-                    if diff < 0:
-                        keep_len = max(0, len(f_base_str) + diff)
-                        new_line = f_base_str[:keep_len] + r_line.lstrip()
-                    else:
-                        new_line = f_base_str + r_line.lstrip()
+                    new_line = r_line  # Прямое использование отступов, если база не совпадает
 
-                # Если строка была пустой (только пробелы), убираем лишнее, оставляя только отступ
-                if not r_line.strip():
-                    new_line = new_line.rstrip('\n\r')
-
-                new_lines.append(new_line)
+                new_lines.append(new_line.rstrip('\n\r'))
 
             lines = lines[:start] + new_lines + lines[end:]
 
-        # Запись с сохранением оригинальной кодировки и переносов строк
-        temp_path = path + ".tmp"
+        # Запись во временный словарь (в памяти)
         try:
             enc_info = file_encodings.get(path, ('utf-8', '\n'))
             if isinstance(enc_info, tuple):
@@ -777,10 +806,12 @@ def main(ignore_folders=None, ignore_files=None):
 
             if 'utf-16' in enc.lower():
                 print(f"\n{Colors.YELLOW}Файл {path} обнаружен в кодировке {enc}.{Colors.RESET}")
-                try:
-                    ans = input("Разрешить внесение правок и перезаписать в UTF-8? (y/n): ").strip().lower()
-                except EOFError:
-                    ans = 'n'
+                ans = 'y' if AUTO_MODE else 'n'
+                if not AUTO_MODE:
+                    try:
+                        ans = input("Разрешить внесение правок и перезаписать в UTF-8? (y/n): ").strip().lower()
+                    except EOFError:
+                        ans = 'n'
                 if ans in ['y', 'yes', 'да', '1']:
                     enc = 'utf-8'
                     print(f"{Colors.GREEN}Кодировка файла {path} изменена на UTF-8 при сохранении.{Colors.RESET}")
@@ -788,32 +819,40 @@ def main(ignore_folders=None, ignore_files=None):
                     print(f"{Colors.RED}Правки для файла {path} отменены.{Colors.RESET}")
                     continue
 
-            with open(temp_path, 'w', encoding=enc, newline=newline_char) as f:
-                f.write("\n".join(lines) + "\n")
-
-            pending_replacements.append((temp_path, path))
+            pending_replacements.append((path, lines, enc, newline_char))
         except Exception as e:
             print(f"{Colors.RED}Ошибка при подготовке файла {path}: {e}{Colors.RESET}")
-            # Откат всех созданных .tmp
-            for t_path, _ in pending_replacements:
-                if os.path.exists(t_path):
-                    try: os.remove(t_path)
-                    except: pass
             return False
 
-    # Второй проход: Атомарная замена реальных файлов (Транзакционность)
-    for temp_path, path in pending_replacements:
-        try:
+    # Второй проход: Создание бэкапов и атомарная перезапись (Транзакционность)
+    backups = []
+    import shutil
+    try:
+        for path, lines, enc, newline_char in pending_replacements:
             if os.path.exists(path):
-                os.replace(temp_path, path)
-            else:
-                os.rename(temp_path, path)
+                backup_path = path + ".bak.tmp"
+                shutil.copy2(path, backup_path)
+                backups.append((path, backup_path))
+            
+            with open(path, 'w', encoding=enc, newline='') as f:
+                f.write(newline_char.join(lines) + newline_char)
             print(f"Обновлен файл: {Colors.YELLOW}{path}{Colors.RESET}")
             files_changed += 1
-        except Exception as e:
-            print(f"{Colors.RED}КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПИСИ {path}: {e}{Colors.RESET}")
-            print(f"{Colors.YELLOW}ВНИМАНИЕ: Произошел частичный сбой. Транзакционность нарушена!{Colors.RESET}")
-            return False
+
+        # Очистка бэкапов при успехе
+        for _, backup_path in backups:
+            try: os.remove(backup_path)
+            except: pass
+    except Exception as e:
+        print(f"{Colors.RED}КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПИСИ: {e}{Colors.RESET}")
+        print(f"{Colors.YELLOW}Выполняется откат изменений...{Colors.RESET}")
+        for path, backup_path in backups:
+            try:
+                os.replace(backup_path, path)
+                print(f"{Colors.GREEN}Откат файла {path} успешен.{Colors.RESET}")
+            except Exception as rb_e:
+                print(f"{Colors.RED}Ошибка отката {path}: {rb_e}{Colors.RESET}")
+        return False
 
     print(f"\n{Colors.GREEN}{'=' * 60}")
     print(f"Правки применены.")

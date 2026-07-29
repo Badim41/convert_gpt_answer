@@ -353,7 +353,9 @@ def find_matches(search_lines, file_lines):
     while i <= n_f - n_s:
         match = True
         for j in range(n_s):
-            if file_lines[i + j].rstrip('\r\n') != search_lines[j].rstrip('\r\n'):
+            # rstrip() убирает ВСЕ пробельные символы в конце строки (включая пробелы, \r, \n),
+            # но сохраняет ведущие отступы (что критично для питона)
+            if file_lines[i + j].rstrip() != search_lines[j].rstrip():
                 match = False
                 break
         if match:
@@ -504,6 +506,7 @@ def main(ignore_folders=None, ignore_files=None):
     # 2. Поиск совпадений
     block_matches = []
     already_applied_blocks = {}
+    user_skipped_blocks = set()
 
     code_file_contents = {p: l for p, l in file_contents.items() if os.path.splitext(p)[1].lower() in CODE_EXTENSIONS or not os.path.splitext(p)[1]}
     other_file_contents = {p: l for p, l in file_contents.items() if p not in code_file_contents}
@@ -638,7 +641,10 @@ def main(ignore_folders=None, ignore_files=None):
 
                 if AUTO_MODE and stats['char_similarity_pct'] > 90:
                     ans = 'y'
-                    print("Auto-mode: Сходство высокое, блок подтвержден.")
+                    print(f"{Colors.GREEN}Auto-mode: Сходство высокое, блок подтвержден.{Colors.RESET}")
+                elif stats['char_similarity_pct'] == 100.0 and stats['line_mismatch_pct'] == 0.0:
+                    ans = 'y'
+                    print(f"{Colors.GREEN}Сходство 100% (с учетом игнорирования отступов). Автоматическое подтверждение.{Colors.RESET}")
                 else:
                     try:
                         ans = input("Подтвердить? y/n: ").strip().lower()
@@ -648,6 +654,8 @@ def main(ignore_folders=None, ignore_files=None):
                 if ans in ['y', 'yes', 'да', '1']:
                     matches_for_block.append((path, start, end))
                     break
+                else:
+                    user_skipped_blocks.add(idx)
 
         if not matches_for_block:
             replace_lines = block['replace']
@@ -675,6 +683,10 @@ def main(ignore_folders=None, ignore_files=None):
 
     for idx, matches in enumerate(block_matches):
         if len(matches) == 0:
+            if idx in user_skipped_blocks:
+                print(f"{Colors.YELLOW}Блок {idx + 1} пропущен пользователем.{Colors.RESET}")
+                continue
+
             if idx in already_applied_blocks:
                 locs = already_applied_blocks[idx]
                 if locs:
@@ -682,7 +694,7 @@ def main(ignore_folders=None, ignore_files=None):
                     print(f"\n{Colors.YELLOW}ВНИМАНИЕ: Для блока {idx + 1} оригинал не найден, но точная копия текста ЗАМЕНЫ уже присутствует в коде:{Colors.RESET}")
                     print(f"  - {locs_str}")
                     try:
-                        ans = input("похоже, правки уже внесены. Пропустить этот блок? (y/n): ").strip().lower()
+                        ans = input("Похоже, правки уже внесены. Пропустить этот блок? (y/n): ").strip().lower()
                     except EOFError:
                         ans = 'n'
                     if ans in ['y', 'yes', 'да', '1']:

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='convert_gpt_answer',
-    version='4.0',
+    version='4.1',
     packages=find_packages(),
     install_requires=[
         'json-repair',

@@ -496,46 +496,6 @@ class CodeIndexer:
 
         return file_contents, file_encodings, non_utf8_files, code_file_contents, other_file_contents
 
-def get_all_text_files(root_dir='.', ignore_folders=None, ignore_files=None, prompt_filenames=None):
-    folders_to_ignore = set(IGNORE_DIRS)
-    if ignore_folders:
-        folders_to_ignore.update(ignore_folders)
-
-    files_to_ignore = set(ignore_files) if ignore_files else set()
-    prompt_filenames = prompt_filenames or set()
-
-    all_filepaths = _scan_directory_tree(root_dir, folders_to_ignore, files_to_ignore)
-    file_stats = []
-
-    def process_file(file_path):
-        try:
-            stat = os.stat(file_path)
-            size = stat.st_size
-            if size > 1 * 1024 * 1024:
-                return None
-            if is_binary_file(file_path):
-                return None
-            return {
-                'path': file_path,
-                'size': size,
-                'mtime': stat.st_mtime,
-                'priority': 100 if os.path.basename(file_path) in prompt_filenames else 0
-            }
-        except OSError:
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-        results = executor.map(process_file, all_filepaths)
-        for res in results:
-            if res:
-                file_stats.append(res)
-
-    file_stats.sort(key=lambda x: (-x['priority'], -x['mtime'], x['size']))
-    return [item['path'] for item in file_stats]
-
-
-def normalize_str(s):
-    return s.strip()
 
 
 def can_contain_block(search_lines, f_text):
@@ -556,25 +516,29 @@ def get_fuzzy_ratio(s1, s2):
 
 
 def detect_indent_style(lines):
-    spaces_count = {}
+    indents = []
+    has_tabs = False
     for line in lines:
         if not line.strip():
             continue
-        indent = len(line) - len(line.lstrip())
-        if indent == 0:
-            continue
         if line.startswith('\t'):
-            return ('tab', 1)
-        else:
-            if indent not in spaces_count:
-                spaces_count[indent] = 0
-            spaces_count[indent] += 1
-    if not spaces_count:
+            has_tabs = True
+        indents.append(len(line) - len(line.lstrip()))
+
+    if has_tabs:
+        return ('tab', 1)
+
+    diffs = {}
+    for i in range(1, len(indents)):
+        diff = abs(indents[i] - indents[i - 1])
+        if diff > 0:
+            diffs[diff] = diffs.get(diff, 0) + 1
+
+    if not diffs:
         return ('space', 4)  # Fallback
 
-    # Находим самый популярный минимальный отступ
-    min_indent = min([k for k in spaces_count.keys() if k > 0], default=4)
-    return ('space', min_indent)
+    most_common_diff = max(diffs.items(), key=lambda x: x[1])[0]
+    return ('space', most_common_diff)
 
 def adapt_indentation(replace_lines, source_style, target_style):
     if source_style == target_style:
@@ -907,6 +871,11 @@ def execute_powershell(script):
 
 
 def main(ignore_folders=None, ignore_files=None):
+    if not ignore_folders:
+        ignore_folders = []
+    if not ignore_files:
+        ignore_files = []
+    
     blocks, input_lines = parse_input()
     prompt_filenames = extract_filenames_from_prompt(input_lines)
 
@@ -1245,33 +1214,52 @@ def main(ignore_folders=None, ignore_files=None):
             replace_lines = mod['replace']
 
             target_style = detect_indent_style(lines)
-            source_style = detect_indent_style(search_lines)
-            adapted_replace = adapt_indentation(replace_lines, source_style, target_style)
+            source_style = detect_indent_style(replace_lines)
 
             f_base_str = ""
-            s_base_str = ""
             for j in range(min(len(search_lines), len(lines) - start)):
                 if search_lines[j].strip() and lines[start + j].strip():
-                    s_line = search_lines[j]
-                    s_base_str = s_line[:len(s_line) - len(s_line.lstrip())]
                     f_line = lines[start + j]
                     f_base_str = f_line[:len(f_line) - len(f_line.lstrip())]
                     break
 
+            r_base_str = ""
+            for r_line in replace_lines:
+                if r_line.strip():
+                    r_base_str = r_line[:len(r_line) - len(r_line.lstrip())]
+                    break
+
+            s_type, s_size = source_style
+            t_type, t_size = target_style
+
             new_lines = []
-            for r_line in adapted_replace:
+            for r_line in replace_lines:
                 if not r_line.strip():
                     new_lines.append("")
                     continue
 
                 r_indent_str = r_line[:len(r_line) - len(r_line.lstrip())]
 
-                if r_indent_str.startswith(s_base_str) and len(s_base_str) > 0:
-                    relative_indent_str = r_indent_str[len(s_base_str):]
-                    new_line = f_base_str + relative_indent_str + r_line.lstrip()
+                # Вычисляем относительный отступ от базового (r_base_str)
+                if r_indent_str.startswith(r_base_str):
+                    relative_indent_len = len(r_indent_str) - len(r_base_str)
                 else:
-                    new_line = r_line  # Прямое использование отступов, если база не совпадает
+                    relative_indent_len = 0 # Fallback, если строка оказалась левее базы
 
+                # Конвертируем относительный отступ под целевой стиль
+                if s_type == 'space':
+                    levels = relative_indent_len / s_size
+                else:
+                    levels = relative_indent_len
+
+                levels = max(0, int(round(levels)))
+
+                if t_type == 'tab':
+                    scaled_relative_indent = '\t' * levels
+                else:
+                    scaled_relative_indent = ' ' * (levels * t_size)
+
+                new_line = f_base_str + scaled_relative_indent + r_line.lstrip()
                 new_lines.append(new_line.rstrip('\n\r'))
 
             lines = lines[:start] + new_lines + lines[end:]

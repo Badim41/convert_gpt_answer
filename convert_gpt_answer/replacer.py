@@ -878,6 +878,7 @@ def main(ignore_folders=None, ignore_files=None):
     block_matches = []
     already_applied_blocks = {}
     user_skipped_blocks = set()
+    cached_blocks = set()
 
     def get_candidates(search_lines, target_files, use_fts=True):
         cands = []
@@ -922,6 +923,7 @@ def main(ignore_folders=None, ignore_files=None):
         patch_hash = indexer.get_patch_hash(search_lines, replace_lines)
         if indexer.is_patch_applied(patch_hash):
             print(f"\n{Colors.GREEN}Блок {idx + 1} уже был применен ранее (пропущен благодаря кэшу БД).{Colors.RESET}")
+            cached_blocks.add(idx)
             block_matches.append([])
             continue
 
@@ -1078,6 +1080,9 @@ def main(ignore_folders=None, ignore_files=None):
 
     for idx, matches in enumerate(block_matches):
         if len(matches) == 0:
+            if idx in cached_blocks:
+                continue
+
             if idx in user_skipped_blocks:
                 print(f"{Colors.YELLOW}Блок {idx + 1} пропущен пользователем.{Colors.RESET}")
                 continue

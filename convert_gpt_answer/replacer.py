@@ -101,7 +101,7 @@ def extract_filenames_from_prompt(lines):
 def parse_input():
     print(f"{Colors.YELLOW}Введите текст с блоками правок. {Colors.RESET}")
     print(
-        f"{Colors.YELLOW}Для подтверждения отправки введите {Colors.GREEN}.,,,{Colors.YELLOW} на новой пустой строке и нажмите Enter:{Colors.RESET}")
+        f"{Colors.YELLOW}Для подтверждения отправки введите {Colors.GREEN}.,,,{Colors.YELLOW} на новой пустой строке и нажмите Enter (или {Colors.GREEN},!!!{Colors.YELLOW} для отката):{Colors.RESET}")
 
     lines = []
     while True:
@@ -109,8 +109,11 @@ def parse_input():
             line = sys.stdin.readline()
             if not line:
                 break
-            # Условие завершения ввода
-            if line.strip() == '.,,,':
+            # Условие завершения ввода или отката
+            stripped = line.strip()
+            if stripped == ',!!!':
+                return 'UNDO', lines
+            if stripped == '.,,,':
                 break
             lines.append(line)
         except EOFError:
@@ -826,6 +829,10 @@ def main(ignore_folders=None, ignore_files=None):
         ignore_files = []
     
     blocks, input_lines = parse_input()
+    if blocks == 'UNDO':
+        TransactionManager().undo_last()
+        return True
+
     prompt_filenames = extract_filenames_from_prompt(input_lines)
 
     ps_commands = extract_powershell_commands(input_lines)

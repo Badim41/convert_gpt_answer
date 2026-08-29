@@ -81,25 +81,58 @@ def get_clipboard_content():
     if sys.platform == 'win32':
         try:
             import ctypes
+            from ctypes import wintypes
+
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
+
+            # Явно задаем 64-битные типы аргументов и возвращаемых значений
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.OpenClipboard.restype = wintypes.BOOL
+
+            user32.CloseClipboard.argtypes = []
+            user32.CloseClipboard.restype = wintypes.BOOL
+
+            user32.GetClipboardData.argtypes = [wintypes.UINT]
+            user32.GetClipboardData.restype = wintypes.HANDLE
+
+            user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+            user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+
+            kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+
+            kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            kernel32.GlobalUnlock.restype = wintypes.BOOL
+
             CF_UNICODETEXT = 13
-            if user32.OpenClipboard(None):
-                try:
-                    h_clip = user32.GetClipboardData(CF_UNICODETEXT)
-                    if h_clip:
-                        kernel32.GlobalLock.restype = ctypes.c_void_p
+
+            # Пробуем открыть буфер (до 5 попыток с задержкой, если занят другой программой)
+            for _ in range(5):
+                if user32.OpenClipboard(None):
+                    try:
+                        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+                            return ""
+                        h_clip = user32.GetClipboardData(CF_UNICODETEXT)
+                        if not h_clip:
+                            return ""
                         p_clip = kernel32.GlobalLock(h_clip)
-                        if p_clip:
-                            try:
-                                text = ctypes.c_wchar_p(p_clip).value
-                                return text or ""
-                            finally:
-                                kernel32.GlobalUnlock(h_clip)
-                finally:
-                    user32.CloseClipboard()
+                        if not p_clip:
+                            return ""
+                        try:
+                            # Безопасное прямое чтение UTF-16 строки из 64-битного адреса
+                            return ctypes.wstring_at(p_clip)
+                        finally:
+                            kernel32.GlobalUnlock(h_clip)
+                    finally:
+                        user32.CloseClipboard()
+                    break
+                time.sleep(0.02)
+            return ""
         except Exception:
-            pass
+            return ""
+    
+    # Fallback для Linux / MacOS
     try:
         import tkinter as tk
         root = tk.Tk()
@@ -108,8 +141,7 @@ def get_clipboard_content():
         root.destroy()
         return text or ""
     except Exception:
-        pass
-    return ""
+        return ""
 
 def has_actionable_markers(text):
     if not text:
@@ -1422,18 +1454,18 @@ def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, 
         TransactionManager().undo_last()
         return
 
-    # Проверка: запущен ли в системе другой replacer с check_clipboard=True
-    active_proc = check_active_clipboard_process()
-    if active_proc:
-        print(f"\n{Colors.RED}{'=' * 60}")
-        print(f"КРИТИЧЕСКАЯ ОШИБКА: Другой replacer уже запущен с параметром check_clipboard=True!")
-        print(f"PID: {active_proc['pid']}")
-        print(f"Директория: {active_proc['dir']}")
-        print(f"Работа завершена во избежание применения правок не в тот проект.")
-        print(f"{'=' * 60}{Colors.RESET}")
-        sys.exit(1)
-
     if check_clipboard:
+        # Проверка: запущен ли в системе другой replacer с check_clipboard=True
+        active_proc = check_active_clipboard_process()
+        if active_proc:
+            print(f"\n{Colors.RED}{'=' * 60}")
+            print(f"КРИТИЧЕСКАЯ ОШИБКА: Другой replacer уже запущен с параметром check_clipboard=True!")
+            print(f"PID: {active_proc['pid']}")
+            print(f"Директория: {active_proc['dir']}")
+            print(f"Работа завершена во избежание применения правок не в тот проект.")
+            print(f"{'=' * 60}{Colors.RESET}")
+            sys.exit(1)
+
         acquire_clipboard_lock()
         atexit.register(release_clipboard_lock)
         print(f"{Colors.GREEN}Режим мониторинга буфера обмена включен (проверка каждую 1 сек).{Colors.RESET}")

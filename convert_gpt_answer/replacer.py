@@ -12,6 +12,118 @@ import threading
 import zipfile
 import ast
 import datetime
+import atexit
+
+CLIPBOARD_LOCK_FILE = os.path.join(tempfile.gettempdir(), 'deepsearch_replacer_clipboard.lock')
+
+def is_pid_alive(pid):
+    if pid <= 0:
+        return False
+    if sys.platform == 'win32':
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        h_proc = kernel32.OpenProcess(0x1000, False, pid)
+        if h_proc:
+            kernel32.CloseHandle(h_proc)
+            return True
+        err = kernel32.GetLastError()
+        if err == 5:
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+def check_active_clipboard_process():
+    if not os.path.exists(CLIPBOARD_LOCK_FILE):
+        return None
+    try:
+        with open(CLIPBOARD_LOCK_FILE, 'r', encoding='utf-8') as f:
+            data = f.read().strip().split('|')
+            if len(data) >= 2:
+                pid = int(data[0])
+                proj_dir = data[1]
+                if pid != os.getpid() and is_pid_alive(pid):
+                    return {'pid': pid, 'dir': proj_dir}
+        try:
+            os.remove(CLIPBOARD_LOCK_FILE)
+        except OSError:
+            pass
+        return None
+    except Exception:
+        return None
+
+def acquire_clipboard_lock():
+    try:
+        with open(CLIPBOARD_LOCK_FILE, 'w', encoding='utf-8') as f:
+            f.write(f"{os.getpid()}|{os.path.abspath('.')}")
+        return True
+    except Exception:
+        return False
+
+def release_clipboard_lock():
+    try:
+        if os.path.exists(CLIPBOARD_LOCK_FILE):
+            with open(CLIPBOARD_LOCK_FILE, 'r', encoding='utf-8') as f:
+                data = f.read().strip().split('|')
+                if len(data) >= 1 and int(data[0]) == os.getpid():
+                    pass
+                else:
+                    return
+            os.remove(CLIPBOARD_LOCK_FILE)
+    except Exception:
+        pass
+
+def get_clipboard_content():
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            CF_UNICODETEXT = 13
+            if user32.OpenClipboard(None):
+                try:
+                    h_clip = user32.GetClipboardData(CF_UNICODETEXT)
+                    if h_clip:
+                        kernel32.GlobalLock.restype = ctypes.c_void_p
+                        p_clip = kernel32.GlobalLock(h_clip)
+                        if p_clip:
+                            try:
+                                text = ctypes.c_wchar_p(p_clip).value
+                                return text or ""
+                            finally:
+                                kernel32.GlobalUnlock(h_clip)
+                finally:
+                    user32.CloseClipboard()
+        except Exception:
+            pass
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        text = root.clipboard_get()
+        root.destroy()
+        return text or ""
+    except Exception:
+        pass
+    return ""
+
+def has_actionable_markers(text):
+    if not text:
+        return False
+    if ',!!!' in text:
+        return True
+    start_tag = '<' * 4
+    mid_tag = '=' * 4
+    end_tag = '>' * 4
+    if start_tag in text and mid_tag in text and end_tag in text:
+        return True
+    if "$content = @'" in text or "$content=@'" in text or "```powershell" in text or "```ps1" in text or "```ps" in text:
+        return True
+    return False
 
 RG_AVAILABLE = shutil.which('rg') is not None
 
@@ -98,39 +210,26 @@ def extract_filenames_from_prompt(lines):
     return filenames
 
 
-def parse_input():
-    print(f"{Colors.YELLOW}Введите текст с блоками правок. {Colors.RESET}")
-    print(
-        f"{Colors.YELLOW}Для подтверждения отправки введите {Colors.GREEN}.,,,{Colors.YELLOW} на новой пустой строке и нажмите Enter (или {Colors.GREEN},!!!{Colors.YELLOW} для отката):{Colors.RESET}")
-
-    lines = []
-    while True:
-        try:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            # Условие завершения ввода или отката
-            stripped = line.strip()
-            if stripped == ',!!!':
-                return 'UNDO', lines
-            if stripped == '.,,,':
-                break
-            lines.append(line)
-        except EOFError:
-            break
+def parse_patch_blocks(lines):
+    for line in lines:
+        if line.strip() == ',!!!':
+            return 'UNDO'
 
     blocks = []
     state = 0  # 0: поиск <<<<, 1: сбор оригинала (поиск ====), 2: сбор нового текста (поиск >>>>)
     current_search = []
     current_replace = []
 
+    start_marker = '<' * 4
+    mid_marker = '=' * 4
+    end_marker = '>' * 4
+
     for line_idx, line in enumerate(lines):
         stripped = line.strip()
 
-        # Поддержка маркеров любой длины от 4 символов с возможностью комментариев или имен файлов в конце
-        is_start = stripped.startswith('<<<<')
-        is_mid = stripped.startswith('====')
-        is_end = stripped.startswith('>>>>')
+        is_start = stripped.startswith(start_marker)
+        is_mid = stripped.startswith(mid_marker)
+        is_end = stripped.startswith(end_marker)
 
         if state == 0:
             if is_start:
@@ -160,7 +259,6 @@ def parse_input():
             elif not is_start and not is_mid:
                 current_replace.append(line.rstrip('\r\n'))
 
-    # Решает проблему потери последнего блока при EOF
     if state == 2:
         def trim_lines_search(l):
             s, e = 0, len(l)
@@ -169,6 +267,30 @@ def parse_input():
             return l[s:e]
         blocks.append({'search': trim_lines_search(current_search), 'replace': current_replace})
 
+    return blocks
+
+
+def parse_input():
+    print(f"{Colors.YELLOW}Введите текст с блоками правок. {Colors.RESET}")
+    print(
+        f"{Colors.YELLOW}Для подтверждения отправки введите {Colors.GREEN}.,,,{Colors.YELLOW} на новой пустой строке и нажмите Enter (или {Colors.GREEN},!!!{Colors.YELLOW} для отката):{Colors.RESET}")
+
+    lines = []
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            stripped = line.strip()
+            if stripped == ',!!!':
+                return 'UNDO', lines
+            if stripped == '.,,,':
+                break
+            lines.append(line)
+        except EOFError:
+            break
+
+    blocks = parse_patch_blocks(lines)
     return blocks, lines
 
 
@@ -822,13 +944,16 @@ def execute_powershell(script):
         return False
 
 
-def main(ignore_folders=None, ignore_files=None):
+def main(ignore_folders=None, ignore_files=None, input_lines=None):
     if not ignore_folders:
         ignore_folders = []
     if not ignore_files:
         ignore_files = []
     
-    blocks, input_lines = parse_input()
+    if input_lines is None:
+        blocks, input_lines = parse_input()
+    else:
+        blocks = parse_patch_blocks(input_lines)
     if blocks == 'UNDO':
         TransactionManager().undo_last()
         return True
@@ -1292,17 +1417,76 @@ def main(ignore_folders=None, ignore_files=None):
     return True
 
 
-def run_replacer(ignore_folders=None, ignore_files=None):
+def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, skip_clipboard_confirm=False):
     if '--undo' in sys.argv:
         TransactionManager().undo_last()
         return
 
-    while True:
+    # Проверка: запущен ли в системе другой replacer с check_clipboard=True
+    active_proc = check_active_clipboard_process()
+    if active_proc:
+        print(f"\n{Colors.RED}{'=' * 60}")
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: Другой replacer уже запущен с параметром check_clipboard=True!")
+        print(f"PID: {active_proc['pid']}")
+        print(f"Директория: {active_proc['dir']}")
+        print(f"Работа завершена во избежание применения правок не в тот проект.")
+        print(f"{'=' * 60}{Colors.RESET}")
+        sys.exit(1)
+
+    if check_clipboard:
+        acquire_clipboard_lock()
+        atexit.register(release_clipboard_lock)
+        print(f"{Colors.GREEN}Режим мониторинга буфера обмена включен (проверка каждую 1 сек).{Colors.RESET}")
+        if skip_clipboard_confirm:
+            print(f"{Colors.YELLOW}Режим без подтверждения (skip_clipboard_confirm=True) активен.{Colors.RESET}")
+
+        last_clip_hash = None
+        init_text = get_clipboard_content()
+        if init_text and not has_actionable_markers(init_text):
+            last_clip_hash = hashlib.md5(init_text.encode('utf-8', errors='ignore')).hexdigest()
+
         try:
-            main(ignore_folders=ignore_folders, ignore_files=ignore_files)
+            while True:
+                try:
+                    clip_text = get_clipboard_content()
+                    if clip_text:
+                        clip_hash = hashlib.md5(clip_text.encode('utf-8', errors='ignore')).hexdigest()
+                        if clip_hash != last_clip_hash:
+                            last_clip_hash = clip_hash
+                            if has_actionable_markers(clip_text):
+                                lines = [l + '\n' for l in clip_text.splitlines()]
+                                if not skip_clipboard_confirm:
+                                    print(f"\n{Colors.YELLOW}Обнаружены новые правки в буфере обмена.{Colors.RESET}")
+                                    try:
+                                        ans = input(f"Применить правки? [y/n] (Enter=y): ").strip().lower()
+                                        if not ans:
+                                            ans = 'y'
+                                    except EOFError:
+                                        ans = 'n'
+                                    if ans not in ['y', 'yes', 'да', '1', '.,,,']:
+                                        print(f"{Colors.YELLOW}Правки из буфера обмена пропущены.{Colors.RESET}")
+                                        time.sleep(1)
+                                        continue
+
+                                print(f"\n{Colors.GREEN}Обработка правок из буфера обмена...{Colors.RESET}")
+                                main(ignore_folders=ignore_folders, ignore_files=ignore_files, input_lines=lines)
+                    time.sleep(1)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(f"{Colors.RED}Ошибка обработки буфера обмена: {e}{Colors.RESET}")
+                    time.sleep(1)
         except KeyboardInterrupt:
             print(f"\n{Colors.YELLOW}Операция прервана пользователем.{Colors.RESET}")
-            break
+        finally:
+            release_clipboard_lock()
+    else:
+        while True:
+            try:
+                main(ignore_folders=ignore_folders, ignore_files=ignore_files)
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}Операция прервана пользователем.{Colors.RESET}")
+                break
 
 
 if __name__ == '__main__':

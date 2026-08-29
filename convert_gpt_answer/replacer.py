@@ -232,13 +232,16 @@ CODE_EXTENSIONS = {
 
 def extract_filenames_from_prompt(lines):
     filenames = set()
-    pattern = re.compile(r'([@a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]{2,10})')
+    pattern = re.compile(r'[@#*`\'"]?([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]{2,10})')
+    start_tag = '<' * 4
     for line in lines:
-        if line.startswith('<<<<'):
+        if line.strip().startswith(start_tag):
             continue
         for match in pattern.findall(line):
-            if "/" in match or "\\" in match or "." in match:
-                filenames.add(os.path.basename(match))
+            clean = match.strip('@#*`\'":;, ')
+            if clean and ('.' in clean):
+                filenames.add(os.path.normpath(clean))
+                filenames.add(os.path.basename(clean))
     return filenames
 
 
@@ -251,10 +254,28 @@ def parse_patch_blocks(lines):
     state = 0  # 0: поиск <<<<, 1: сбор оригинала (поиск ====), 2: сбор нового текста (поиск >>>>)
     current_search = []
     current_replace = []
+    current_file_hint = None
 
     start_marker = '<' * 4
     mid_marker = '=' * 4
     end_marker = '>' * 4
+
+    def extract_file_hint_from_recent_lines(line_buffer):
+        file_pattern = re.compile(r'[@#*`\'"]?([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]{2,10})')
+        for l in reversed(line_buffer[-12:]):
+            sl = l.strip()
+            if sl.startswith(end_marker) or sl.startswith(mid_marker):
+                break
+            matches = file_pattern.findall(sl)
+            for m in reversed(matches):
+                clean = m.strip('@#*`\'":;, ')
+                if '.' in clean and not clean.endswith('.'):
+                    ext = os.path.splitext(clean)[1].lower()
+                    if ext in CODE_EXTENSIONS or len(ext) in [3, 4, 5]:
+                        return os.path.normpath(clean)
+        return None
+
+    recent_lines = []
 
     for line_idx, line in enumerate(lines):
         stripped = line.strip()
@@ -265,9 +286,12 @@ def parse_patch_blocks(lines):
 
         if state == 0:
             if is_start:
+                current_file_hint = extract_file_hint_from_recent_lines(recent_lines)
                 state = 1
                 current_search = []
                 current_replace = []
+            else:
+                recent_lines.append(line)
         elif state == 1:
             if is_mid:
                 state = 2
@@ -285,9 +309,12 @@ def parse_patch_blocks(lines):
 
                 blocks.append({
                     'search': trim_lines_search(current_search),
-                    'replace': current_replace
+                    'replace': current_replace,
+                    'file_hint': current_file_hint
                 })
                 state = 0
+                current_file_hint = None
+                recent_lines = []
             elif not is_start and not is_mid:
                 current_replace.append(line.rstrip('\r\n'))
 
@@ -297,7 +324,11 @@ def parse_patch_blocks(lines):
             while s < e and not l[s].strip(): s += 1
             while e > s and not l[e - 1].strip(): e -= 1
             return l[s:e]
-        blocks.append({'search': trim_lines_search(current_search), 'replace': current_replace})
+        blocks.append({
+            'search': trim_lines_search(current_search),
+            'replace': current_replace,
+            'file_hint': current_file_hint
+        })
 
     return blocks
 
@@ -644,8 +675,14 @@ class CodeIndexer:
 
         priority_files = set(prompt_filenames or set())
         def sort_key(item):
-            p = item[0]
-            is_prio = 1 if p in priority_files else 0
+            p_norm = os.path.normpath(item[0]).lower()
+            p_base = os.path.basename(p_norm)
+            is_prio = 0
+            for pf in priority_files:
+                pf_norm = os.path.normpath(pf).lower()
+                if p_norm == pf_norm or p_norm.endswith(os.sep + pf_norm) or p_base == pf_norm:
+                    is_prio = 1
+                    break
             return (-is_prio, len(item[1])) 
 
         code_file_contents = dict(sorted(code_file_contents.items(), key=sort_key))
@@ -976,12 +1013,14 @@ def execute_powershell(script):
         return False
 
 
-def main(ignore_folders=None, ignore_files=None, input_lines=None):
+def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=False):
     if not ignore_folders:
         ignore_folders = []
     if not ignore_files:
         ignore_files = []
     
+    is_auto = auto_mode or AUTO_MODE
+
     if input_lines is None:
         blocks, input_lines = parse_input()
     else:
@@ -1000,7 +1039,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
             print(cmd.strip()[:500] + ("..." if len(cmd.strip()) > 500 else ""))
             print(f"{Colors.YELLOW}-------------------{Colors.RESET}")
 
-        if AUTO_MODE:
+        if is_auto:
             ans = 'y'
             print("Auto-mode: PowerShell скрипт выполняется автоматически.")
         else:
@@ -1009,7 +1048,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
                 if not ans:
                     ans = 'y'
             except EOFError:
-                ans = 'n'
+                ans = 'y'
 
         if ans in ['y', 'yes', 'да', '1']:
             for idx, cmd in enumerate(ps_commands, 1):
@@ -1048,12 +1087,11 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
             else:
                 allowed_paths = indexer.fts_search(search_lines)
 
-        for path in target_files:
-            if allowed_paths is not None and path not in allowed_paths:
-                continue
-
-        for path in target_files:
-            lines = target_files[path]
+        for path, lines in target_files.items():
+            if allowed_paths is not None:
+                p_norm = os.path.normpath(path)
+                if p_norm not in allowed_paths and path not in allowed_paths:
+                    continue
 
             exact_matches = find_matches(search_lines, lines)
             if exact_matches:
@@ -1075,6 +1113,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
     for idx, block in enumerate(blocks):
         search_lines = block['search']
         replace_lines = block['replace']
+        file_hint = block.get('file_hint')
         matches_for_block = []
 
         patch_hash = indexer.get_patch_hash(search_lines, replace_lines)
@@ -1089,14 +1128,14 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
 
         if not candidates and other_file_contents:
             print(f"\n{Colors.YELLOW}Блок {idx + 1} не найден в файлах кода.{Colors.RESET}")
-            ans = 'y' if AUTO_MODE else 'n'
-            if not AUTO_MODE:
+            ans = 'y' if is_auto else 'n'
+            if not is_auto:
                 try:
                     ans = input("Искать в остальных файлах (базы данных, логи и т.д.)? [y/n] (Enter=y): ").strip().lower()
                     if not ans:
                         ans = 'y'
                 except EOFError:
-                    ans = 'n'
+                    ans = 'y'
 
             if ans in ['y', 'yes', 'да', '1']:
                 candidates = get_candidates(search_lines, other_file_contents, use_fts=False)
@@ -1132,12 +1171,40 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
             if newly_read:
                 candidates = get_candidates(search_lines, newly_read, use_fts=False)
 
+        # Приоритизация/фильтрация кандидатов по подсказке имени файла из промпта
+        if file_hint and candidates:
+            hint_norm = os.path.normpath(file_hint).lower()
+            hint_base = os.path.basename(hint_norm)
+            hint_matched = []
+            for c in candidates:
+                c_norm = os.path.normpath(c['path']).lower()
+                if c_norm == hint_norm or c_norm.endswith(os.sep + hint_norm) or c_norm.endswith('/' + hint_norm):
+                    hint_matched.append(c)
+            if not hint_matched:
+                for c in candidates:
+                    if os.path.basename(os.path.normpath(c['path']).lower()) == hint_base:
+                        hint_matched.append(c)
+            if hint_matched:
+                candidates = hint_matched
+
         # Сортировка по совпадению (сначала наиболее похожие)
         candidates.sort(key=lambda x: x['ratio'], reverse=True)
 
         # Если найдено точное совпадение (ratio > 0.999), берем его без лишних вопросов
         exact_candidates = [c for c in candidates if c['ratio'] >= 0.999]
         if exact_candidates:
+            if len(exact_candidates) > 1 and prompt_filenames:
+                prio_exact = []
+                for ec in exact_candidates:
+                    ec_norm = os.path.normpath(ec['path']).lower()
+                    for pf in prompt_filenames:
+                        pf_norm = os.path.normpath(pf).lower()
+                        if ec_norm == pf_norm or ec_norm.endswith(os.sep + pf_norm) or ec_norm.endswith('/' + pf_norm):
+                            prio_exact.append(ec)
+                            break
+                if prio_exact:
+                    exact_candidates = prio_exact
+
             for ec in exact_candidates:
                 matches_for_block.append((ec['path'], ec['start'], ec['end']))
         else:
@@ -1191,19 +1258,22 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
                             print(f"  Лишняя строка в файле:")
                             print(f"    Найдено  : {Colors.GREEN}{c_line.strip()}{Colors.RESET}")
 
-                if AUTO_MODE and stats['char_similarity_pct'] > 90:
+                if is_auto and stats['char_similarity_pct'] > 90:
                     ans = 'y'
                     print(f"{Colors.GREEN}Auto-mode: Сходство высокое, блок подтвержден.{Colors.RESET}")
                 elif stats['char_similarity_pct'] == 100.0 and stats['line_mismatch_pct'] == 0.0:
                     ans = 'y'
                     print(f"{Colors.GREEN}Сходство 100% (с учетом игнорирования отступов). Автоматическое подтверждение.{Colors.RESET}")
+                elif is_auto:
+                    ans = 'y'
+                    print(f"{Colors.GREEN}Auto-mode: блок автоматически подтвержден.{Colors.RESET}")
                 else:
                     try:
                         ans = input("Подтвердить? [y/n] (Enter=y): ").strip().lower()
                         if not ans:
                             ans = 'y'
                     except EOFError:
-                        ans = 'n'
+                        ans = 'y'
 
                 if ans in ['y', 'yes', 'да', '1']:
                     matches_for_block.append((path, start, end))
@@ -1217,7 +1287,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
                 applied_locs = []
                 for path, lines in file_contents.items():
                     # Проверяем, есть ли уже блок замены в каком-либо файле
-                    # Игнорируем пустые строки для более надежной проверки
                     non_empty_replace = [l for l in replace_lines if l.strip()]
                     found_replacements = find_matches(non_empty_replace, lines) if non_empty_replace else []
                     for m in found_replacements:
@@ -1250,12 +1319,15 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
                     locs_str = "\n  - ".join([f"{p} (строки {s + 1}-{e})" for p, s, e in locs])
                     print(f"\n{Colors.YELLOW}ВНИМАНИЕ: Для блока {idx + 1} оригинал не найден, но точная копия текста ЗАМЕНЫ уже присутствует в коде:{Colors.RESET}")
                     print(f"  - {locs_str}")
-                    try:
-                        ans = input("Похоже, правки уже внесены. Пропустить этот блок? [y/n] (Enter=y): ").strip().lower()
-                        if not ans:
+                    if is_auto:
+                        ans = 'y'
+                    else:
+                        try:
+                            ans = input("Похоже, правки уже внесены. Пропустить этот блок? [y/n] (Enter=y): ").strip().lower()
+                            if not ans:
+                                ans = 'y'
+                        except EOFError:
                             ans = 'y'
-                    except EOFError:
-                        ans = 'n'
                     if ans in ['y', 'yes', 'да', '1']:
                         continue
                 else:
@@ -1267,29 +1339,47 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
             errors.append(err_msg)
             missing_blocks += 1
         elif len(matches) > 1:
+            # Попытка устранить неоднозначность по подсказкам файлов из промпта
+            if prompt_filenames:
+                filtered_matches = []
+                for p, s, e in matches:
+                    p_norm = os.path.normpath(p).lower()
+                    for pf in prompt_filenames:
+                        pf_norm = os.path.normpath(pf).lower()
+                        if p_norm == pf_norm or p_norm.endswith(os.sep + pf_norm) or p_norm.endswith('/' + pf_norm):
+                            filtered_matches.append((p, s, e))
+                            break
+                if len(filtered_matches) == 1:
+                    matches = filtered_matches
+                    block_matches[idx] = matches
+
+            if len(matches) == 1:
+                continue
+
             locs = "\n  - ".join([f"{p} (строки {s + 1}-{e})" for p, s, e in matches])
             print(f"\n{Colors.YELLOW}Блок {idx + 1} найден {len(matches)} раз (Неоднозначность!).\nГде найдено:\n  - {locs}{Colors.RESET}")
-            if AUTO_MODE:
-                ans = '1'
-                print("Auto-mode: применяем только к первому совпадению.")
+            if is_auto:
+                ans = 'y'
+                print(f"{Colors.GREEN}Auto-mode: применяем ко всем {len(matches)} совпадениям.{Colors.RESET}")
             else:
                 try:
-                    ans = input("Применить ко всем? (y - ко всем, 1 - только к первому, s - пропустить) [Enter=y]: ").strip().lower()
+                    ans = input("Применить ко всем? (y - ко всем, 1 - только к первому, s/n - пропустить) [Enter=y]: ").strip().lower()
                     if not ans:
                         ans = 'y'
                 except EOFError:
-                    ans = 's'
+                    ans = 'y'
 
-            if ans in ['s', 'skip', 'пропустить']:
+            if ans in ['s', 'skip', 'n', 'no', 'нет', 'пропустить']:
                 print(f"{Colors.YELLOW}Блок {idx + 1} пропущен пользователем.{Colors.RESET}")
+                user_skipped_blocks.add(idx)
                 block_matches[idx] = []
-            elif ans == '1':
+            elif ans in ['1', 'первый', 'first']:
                 block_matches[idx] = [matches[0]]
-            elif ans not in ['y', 'yes', 'да']:
-                err_msg = f"Блок {idx + 1} найден {len(matches)} раз.\nГде найдено:\n  - {locs}\nОригинальный текст:\n" + "\n".join(
-                    blocks[idx]['search'])
-                errors.append(err_msg)
-                duplicate_blocks += 1
+            elif ans in ['y', 'yes', 'да', 'all', 'все', '.,,,']:
+                block_matches[idx] = matches
+            else:
+                print(f"{Colors.YELLOW}Применяем ко всем найденным файлам.{Colors.RESET}")
+                block_matches[idx] = matches
 
     if errors:
         print(f"\n{Colors.RED}{'=' * 60}")
@@ -1352,14 +1442,14 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
 
             if 'utf-16' in enc.lower():
                 print(f"\n{Colors.YELLOW}Файл {path} обнаружен в кодировке {enc}.{Colors.RESET}")
-                ans = 'y' if AUTO_MODE else 'n'
-                if not AUTO_MODE:
+                ans = 'y' if is_auto else 'n'
+                if not is_auto:
                     try:
                         ans = input("Разрешить внесение правок и перезаписать в UTF-8? [y/n] (Enter=y): ").strip().lower()
                         if not ans:
                             ans = 'y'
                     except EOFError:
-                        ans = 'n'
+                        ans = 'y'
                 if ans in ['y', 'yes', 'да', '1']:
                     enc = 'utf-8'
                     print(f"{Colors.GREEN}Кодировка файла {path} изменена на UTF-8 при сохранении.{Colors.RESET}")
@@ -1391,7 +1481,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
         if not is_valid:
             print(f"\n{Colors.RED}Синтаксическая ошибка в файле {path}:{Colors.RESET}")
             print(f"{Colors.YELLOW}{err_msg}{Colors.RESET}")
-            if AUTO_MODE:
+            if is_auto:
                 ans = 'y'
                 print(f"{Colors.YELLOW}Auto-mode: Игнорируем синтаксическую ошибку.{Colors.RESET}")
             else:
@@ -1449,10 +1539,12 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None):
     return True
 
 
-def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, skip_clipboard_confirm=False):
+def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, skip_clipboard_confirm=False, auto_mode=False):
     if '--undo' in sys.argv:
         TransactionManager().undo_last()
         return
+
+    effective_auto = auto_mode or AUTO_MODE or skip_clipboard_confirm
 
     if check_clipboard:
         # Проверка: запущен ли в системе другой replacer с check_clipboard=True
@@ -1470,7 +1562,7 @@ def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, 
         atexit.register(release_clipboard_lock)
         print(f"{Colors.GREEN}Режим мониторинга буфера обмена включен (проверка каждую 1 сек).{Colors.RESET}")
         if skip_clipboard_confirm:
-            print(f"{Colors.YELLOW}Режим без подтверждения (skip_clipboard_confirm=True) активен.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Режим без подтверждения (skip_clipboard_confirm=True / Auto-mode) активен.{Colors.RESET}")
 
         last_clip_hash = None
         init_text = get_clipboard_content()
@@ -1501,7 +1593,7 @@ def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, 
                                         continue
 
                                 print(f"\n{Colors.GREEN}Обработка правок из буфера обмена...{Colors.RESET}")
-                                main(ignore_folders=ignore_folders, ignore_files=ignore_files, input_lines=lines)
+                                main(ignore_folders=ignore_folders, ignore_files=ignore_files, input_lines=lines, auto_mode=effective_auto)
                     time.sleep(1)
                 except KeyboardInterrupt:
                     raise
@@ -1515,7 +1607,7 @@ def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, 
     else:
         while True:
             try:
-                main(ignore_folders=ignore_folders, ignore_files=ignore_files)
+                main(ignore_folders=ignore_folders, ignore_files=ignore_files, auto_mode=effective_auto)
             except KeyboardInterrupt:
                 print(f"\n{Colors.YELLOW}Операция прервана пользователем.{Colors.RESET}")
                 break

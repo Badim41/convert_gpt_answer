@@ -61,6 +61,7 @@ class JobObjectIsolationError(PowerShellSecurityException):
 class ExecutionStrategy(str, Enum):
     NATIVE_TRANSPILATION = "NATIVE_TRANSPILATION"
     ISOLATED_POWERSHELL = "ISOLATED_POWERSHELL"
+    DIRECT_POWERSHELL = "DIRECT_POWERSHELL"
     REJECTED = "REJECTED"
 
 
@@ -885,6 +886,65 @@ class SandboxedPowerShellRunner:
                 pass
 
 
+class DirectPowerShellRunner:
+    """Прямой запуск PowerShell в рабочей директории проекта без песочницы."""
+
+    @classmethod
+    def execute(cls, script: str, root_dir: Path) -> SlowPathExecutionResult:
+        executable_path = TrustedRuntimeResolver.resolve_powershell_executable()
+        temp_dir = Path(tempfile.gettempdir())
+        ephemeral_file = temp_dir / f"ps_direct_{secrets.token_hex(8)}.ps1"
+
+        with open(ephemeral_file, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(script)
+
+        start_time = time.time()
+        cmd = [
+            str(executable_path),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy", "Bypass",
+            "-File", str(ephemeral_file.resolve())
+        ]
+
+        raw_stdout = b""
+        raw_stderr = b""
+        exit_code = -1
+        creation_flags = 0x08000000 if sys.platform == "win32" else 0
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(root_dir.resolve()),
+                creationflags=creation_flags
+            )
+            raw_stdout, raw_stderr = process.communicate()
+            exit_code = process.returncode
+        except Exception as e:
+            raw_stderr = str(e).encode("utf-8")
+            exit_code = 1
+        finally:
+            if ephemeral_file.exists():
+                try:
+                    ephemeral_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        duration = time.time() - start_time
+        stdout_str = SandboxedPowerShellRunner._decode_stream(raw_stdout)
+        stderr_str = SandboxedPowerShellRunner._decode_stream(raw_stderr)
+
+        return SlowPathExecutionResult(
+            exit_code=exit_code,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            duration_seconds=duration
+        )
+
+
 # ============================================================================
 # ЭТАП 4: ФАСАД ОРКЕСТРАЦИИ
 # ============================================================================
@@ -918,7 +978,7 @@ class PowerShellSecurityOrchestrator:
             tm: "TransactionManager",
             indexer: Optional["CodeIndexer"] = None,
             is_auto: bool = False,
-            disable_all_except_write: bool = True
+            disable_all_except_write: bool = False
     ) -> ScriptExecutionSummary:
         # Эшелон 1: Детерминированный Fast-Path (нативная запись файлов и создание папок)
         assessment = ZeroShellTranspiler.assess(raw_script, root_dir)
@@ -962,6 +1022,30 @@ class PowerShellSecurityOrchestrator:
                     stderr=str(e),
                     error_message=f"Ошибка нативной файловой операции: {e}"
                 )
+
+        # Если disable_all_except_write=False: скрипты разрешены и исполняются напрямую без песочницы
+        if not disable_all_except_write:
+            exec_result = DirectPowerShellRunner.execute(raw_script, root_dir)
+            is_success = exec_result.exit_code == 0
+
+            if indexer is not None:
+                script_hash = hashlib.sha256(raw_script.encode("utf-8", errors="replace")).hexdigest()
+                indexer.record_powershell_audit(
+                    script_hash=script_hash,
+                    strategy=ExecutionStrategy.DIRECT_POWERSHELL.value,
+                    exit_code=exec_result.exit_code,
+                    duration_seconds=exec_result.duration_seconds
+                )
+
+            return ScriptExecutionSummary(
+                success=is_success,
+                strategy=ExecutionStrategy.DIRECT_POWERSHELL,
+                exit_code=exec_result.exit_code,
+                duration_seconds=exec_result.duration_seconds,
+                stdout=exec_result.stdout,
+                stderr=exec_result.stderr,
+                error_message=None if is_success else f"Скрипт завершился с кодом ошибки {exec_result.exit_code}"
+            )
 
         # Применение правила disable_all_except_write: запрет любых команд вне записи файлов/создания папок
         if disable_all_except_write:
@@ -2176,7 +2260,7 @@ def execute_powershell(
         root_dir: Optional[Path] = None,
         indexer: Optional[CodeIndexer] = None,
         is_auto: bool = False,
-        disable_all_except_write: bool = True
+        disable_all_except_write: bool = False
 ) -> bool:
     target_dir = root_dir if root_dir is not None else Path(".")
     tm = TransactionManager(root_dir=str(target_dir))
@@ -2195,7 +2279,7 @@ def execute_powershell(
     return summary.success
 
 
-def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=False, disable_all_except_write=True):
+def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=False, disable_all_except_write=False):
     if not ignore_folders:
         ignore_folders = []
     if not ignore_files:
@@ -2725,7 +2809,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
 
 
 def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, skip_clipboard_confirm=False,
-                 auto_mode=False, disable_all_except_write=True):
+                 auto_mode=False, disable_all_except_write=False):
     if '--undo' in sys.argv:
         TransactionManager().undo_last()
         return

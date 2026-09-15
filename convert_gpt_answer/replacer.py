@@ -30,7 +30,7 @@ except ImportError:
 
 
 # ============================================================================
-# РАЗДЕЛ БЕЗОПАСНОСТИ: ДОМЕННЫЕ ИСКЛЮЧЕНИЯ И ТИПЫ (ЭТАПЫ 1 И 2)
+# РАЗДЕЛ БЕЗОПАСНОСТИ: ДОМЕННЫЕ ИСКЛЮЧЕНИЯ И ТИПЫ
 # ============================================================================
 
 class PowerShellSecurityException(Exception):
@@ -123,6 +123,10 @@ class SecurePathResolver:
         candidate_path = Path(clean_path_str)
         resolved_root = root_dir.resolve()
 
+        # Защита от дублирования папки: если replacer запущен внутри dl_extension, а путь начинается с dl_extension/
+        if len(candidate_path.parts) > 1 and candidate_path.parts[0].lower() == resolved_root.name.lower():
+            candidate_path = Path(*candidate_path.parts[1:])
+
         if candidate_path.is_absolute():
             resolved_target = candidate_path.resolve()
         else:
@@ -159,33 +163,11 @@ class ZeroShellTranspiler:
         "default": "utf-8"
     }
 
-    # Регулярные выражения для heredoc синтаксиса PowerShell
     HEREDOC_PATTERN: Final[re.Pattern[str]] = re.compile(
-        r"^\s*\$content\s*=\s*@(['\"])\r?\n(?P<content>[\s\S]*?)\r?\n\1@\s*$",
-        re.MULTILINE
+        r"^\s*\$(?:content|filecontent|data|text)\s*=\s*@(['\"])[ \t]*\r?\n(?P<content>[\s\S]*?)\r?\n[ \t]*\1@\s*$",
+        re.MULTILINE | re.IGNORECASE
     )
 
-    IO_FILE_WRITE_PATTERN: Final[re.Pattern[str]] = re.compile(
-        r"\[System\.IO\.File\]::WriteAllText\(\s*[\"'](?P<path>[^\"']+)[\"']\s*,\s*\$content(?:\s*,\s*(?P<enc>[^\)]+))?\s*\)",
-        re.IGNORECASE
-    )
-
-    IO_FILE_APPEND_PATTERN: Final[re.Pattern[str]] = re.compile(
-        r"\[System\.IO\.File\]::AppendAllText\(\s*[\"'](?P<path>[^\"']+)[\"']\s*,\s*\$content(?:\s*,\s*(?P<enc>[^\)]+))?\s*\)",
-        re.IGNORECASE
-    )
-
-    OUT_FILE_PIPELINE_PATTERN: Final[re.Pattern[str]] = re.compile(
-        r"\$content\s*\|\s*(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path)\s+)?[\"']?(?P<path>[^\"'\s]+)[\"']?(?:\s+-Encoding\s+(?P<enc>\w+))?(?:\s+(?P<append>-Append))?",
-        re.IGNORECASE
-    )
-
-    OUT_FILE_DIRECT_PATTERN: Final[re.Pattern[str]] = re.compile(
-        r"(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path)\s+)?[\"']?(?P<path>[^\"'\s]+)[\"']?\s+-InputObject\s+\$content(?:\s+-Encoding\s+(?P<enc>\w+))?(?:\s+(?P<append>-Append))?",
-        re.IGNORECASE
-    )
-
-    # Паттерны создания директорий в пределах проекта
     MKDIR_COMMAND_PATTERN: Final[re.Pattern[str]] = re.compile(
         r"^\s*(?:mkdir|md)\s+[\"']?(?P<path>[^\"'\r\n;]+)[\"']?\s*(?:-Force)?\s*;?\s*$",
         re.IGNORECASE
@@ -197,7 +179,7 @@ class ZeroShellTranspiler:
     )
 
     IO_DIR_CREATE_PATTERN: Final[re.Pattern[str]] = re.compile(
-        r"^\s*\[System\.IO\.Directory\]::CreateDirectory\(\s*[\"'](?P<path>[^\"']+)[\"']\s*\)\s*;?\s*$",
+        r"^\s*\[System\.IO\.Directory\]::CreateDirectory\(\s*[\"'](?P<path>[^\"']+)[\"']\s*\)\s*(?:\|\s*Out-Null)?\s*;?\s*$",
         re.IGNORECASE
     )
 
@@ -205,7 +187,7 @@ class ZeroShellTranspiler:
     def assess(cls, raw_script: str, root_dir: Path) -> TranspilationAssessment:
         normalized_script = raw_script.strip()
 
-        # 1. Проверка на создание папок (mkdir / New-Item -ItemType Directory)
+        # 1. Проверка на изолированные команды создания директорий
         mkdir_match = cls.MKDIR_COMMAND_PATTERN.match(normalized_script)
         new_item_match = cls.NEW_ITEM_DIR_PATTERN.match(normalized_script)
         io_dir_match = cls.IO_DIR_CREATE_PATTERN.match(normalized_script)
@@ -239,9 +221,9 @@ class ZeroShellTranspiler:
                     rejection_reason=str(err),
                     raw_command=raw_script
                 )
-        normalized_script = raw_script.strip()
-        heredoc_match = cls.HEREDOC_PATTERN.search(normalized_script)
 
+        # 2. Проверка на запись файла с Heredoc
+        heredoc_match = cls.HEREDOC_PATTERN.search(normalized_script)
         if not heredoc_match:
             return TranspilationAssessment(
                 is_transpilable=False,
@@ -251,73 +233,115 @@ class ZeroShellTranspiler:
             )
 
         extracted_content = heredoc_match.group("content")
-        preamble_and_trailer = cls.HEREDOC_PATTERN.sub("", normalized_script).strip()
+        script_without_heredoc = cls.HEREDOC_PATTERN.sub("", normalized_script).strip()
 
-        # Разделяем оставшиеся команды и удаляем пустые строки
-        remaining_statements = [
-            stmt.strip() for stmt in preamble_and_trailer.splitlines() if stmt.strip()
-        ]
+        # Сбор объявлений строковых переменных: $filePath = "..." или $path = "..."
+        var_map: Dict[str, str] = {}
+        for var_m in re.finditer(
+            r"\$(?P<var>[a-zA-Z0-9_]+)\s*=\s*[\"'](?P<val>[^\"'\r\n]+)[\"']",
+            script_without_heredoc
+        ):
+            var_map[var_m.group("var").lower()] = var_m.group("val")
 
-        # Удаление безопасной инициализации UTF8Encoding без BOM: $utf8NoBom = New-Object ...
-        clean_statements: List[str] = []
-        has_utf8_no_bom_helper = False
-        for stmt in remaining_statements:
-            if re.match(r"^\$utf8nobom\s*=\s*new-object\s+system\.text\.utf8encoding\s+\$false\s*;?$", stmt,
-                        re.IGNORECASE):
-                has_utf8_no_bom_helper = True
-                continue
-            clean_statements.append(stmt)
-
-        if len(clean_statements) != 1:
-            return TranspilationAssessment(
-                is_transpilable=False,
-                operation=None,
-                rejection_reason=f"Обнаружено недопустимое количество инструкций вне heredoc ({len(clean_statements)} шт.).",
-                raw_command=raw_script
-            )
-
-        file_statement = clean_statements[0]
         mode = FileWriteMode.OVERWRITE
         detected_path: Optional[str] = None
         detected_encoding = "utf-8"
 
-        io_write_match = cls.IO_FILE_WRITE_PATTERN.search(file_statement)
-        io_append_match = cls.IO_FILE_APPEND_PATTERN.search(file_statement)
-        pipe_match = cls.OUT_FILE_PIPELINE_PATTERN.search(file_statement)
-        direct_match = cls.OUT_FILE_DIRECT_PATTERN.search(file_statement)
+        # Шаблоны записи с поддержкой литералов и переменных
+        io_write_re = re.compile(
+            r"\[System\.IO\.File\]::WriteAllText\(\s*(?:[\"'](?P<lit_path>[^\"']+)[\"']|\$(?P<var_path>[a-zA-Z0-9_]+))\s*,\s*\$(?:content|filecontent|data|text)(?:\s*,\s*(?P<enc>[^\)]+))?\s*\)",
+            re.IGNORECASE
+        )
+        io_append_re = re.compile(
+            r"\[System\.IO\.File\]::AppendAllText\(\s*(?:[\"'](?P<lit_path>[^\"']+)[\"']|\$(?P<var_path>[a-zA-Z0-9_]+))\s*,\s*\$(?:content|filecontent|data|text)(?:\s*,\s*(?P<enc>[^\)]+))?\s*\)",
+            re.IGNORECASE
+        )
+        pipe_re = re.compile(
+            r"\$(?:content|filecontent|data|text)\s*\|\s*(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path)\s+)?(?:[\"'](?P<lit_path>[^\"'\s;]+)[\"']|\$(?P<var_path>[a-zA-Z0-9_]+))(?:\s+-Encoding\s+(?P<enc>\w+))?(?:\s+(?P<append>-Append))?",
+            re.IGNORECASE
+        )
+        direct_re = re.compile(
+            r"(?:Out-File|Set-Content)\s+(?:-(?:FilePath|Path)\s+)?(?:[\"'](?P<lit_path>[^\"'\s;]+)[\"']|\$(?P<var_path>[a-zA-Z0-9_]+))\s+(?:-InputObject|-Value)\s+\$(?:content|filecontent|data|text)(?:\s+-Encoding\s+(?P<enc>\w+))?(?:\s+(?P<append>-Append))?",
+            re.IGNORECASE
+        )
 
+        io_write_match = io_write_re.search(script_without_heredoc)
+        io_append_match = io_append_re.search(script_without_heredoc)
+        pipe_match = pipe_re.search(script_without_heredoc)
+        direct_match = direct_re.search(script_without_heredoc)
+
+        has_utf8_no_bom_helper = bool(re.search(r"\$utf8nobom", script_without_heredoc, re.IGNORECASE))
+
+        write_match = None
         if io_write_match:
-            detected_path = io_write_match.group("path")
-            enc_raw = io_write_match.group("enc")
-            if enc_raw and "$utf8nobom" in enc_raw.lower() and has_utf8_no_bom_helper:
-                detected_encoding = "utf-8"
-            elif enc_raw:
-                detected_encoding = cls._normalize_encoding(enc_raw)
+            write_match = io_write_match
         elif io_append_match:
-            detected_path = io_append_match.group("path")
+            write_match = io_append_match
             mode = FileWriteMode.APPEND
-            enc_raw = io_append_match.group("enc")
-            if enc_raw and "$utf8nobom" in enc_raw.lower() and has_utf8_no_bom_helper:
-                detected_encoding = "utf-8"
-            elif enc_raw:
-                detected_encoding = cls._normalize_encoding(enc_raw)
         elif pipe_match:
-            detected_path = pipe_match.group("path")
+            write_match = pipe_match
             if pipe_match.group("append"):
                 mode = FileWriteMode.APPEND
-            if pipe_match.group("enc"):
-                detected_encoding = cls._normalize_encoding(pipe_match.group("enc"))
         elif direct_match:
-            detected_path = direct_match.group("path")
+            write_match = direct_match
             if direct_match.group("append"):
                 mode = FileWriteMode.APPEND
-            if direct_match.group("enc"):
-                detected_encoding = cls._normalize_encoding(direct_match.group("enc"))
-        else:
+
+        if not write_match:
             return TranspilationAssessment(
                 is_transpilable=False,
                 operation=None,
-                rejection_reason=f"Инструкция {file_statement!r} не соответствует безопасным паттернам записи файлов.",
+                rejection_reason="Не найдена безопасная инструкция записи файла (WriteAllText / AppendAllText / Out-File / Set-Content).",
+                raw_command=raw_script
+            )
+
+        if write_match.group("lit_path"):
+            detected_path = write_match.group("lit_path")
+        elif write_match.group("var_path"):
+            vname = write_match.group("var_path").lower()
+            detected_path = var_map.get(vname)
+            if not detected_path:
+                return TranspilationAssessment(
+                    is_transpilable=False,
+                    operation=None,
+                    rejection_reason=f"Переменная пути ${write_match.group('var_path')} не была определена в скрипте.",
+                    raw_command=raw_script
+                )
+
+        enc_raw = write_match.groupdict().get("enc")
+        if enc_raw:
+            if "$utf8nobom" in enc_raw.lower() or has_utf8_no_bom_helper:
+                detected_encoding = "utf-8"
+            else:
+                detected_encoding = cls._normalize_encoding(enc_raw)
+
+        # Валидация остаточных инструкций: удаление допустимого файлового бойлерплейта
+        remainder = write_match.re.sub("", script_without_heredoc)
+        remainder = re.sub(r"\$[a-zA-Z0-9_]+\s*=\s*[^;\r\n]+;?", "", remainder)
+        remainder = re.sub(r"if\s*\([^)]+\)\s*\{[^}]*\}", "", remainder, flags=re.DOTALL | re.IGNORECASE)
+        remainder = re.sub(r"\[System\.IO\.Directory\]::CreateDirectory\([^)]+\)\s*(?:\|\s*Out-Null)?\s*;?", "", remainder, flags=re.IGNORECASE)
+        remainder = re.sub(r"\[System\.IO\.Path\]::GetDirectoryName\([^)]+\)\s*;?", "", remainder, flags=re.IGNORECASE)
+        remainder = re.sub(r"New-Item\s+[^;\r\n]+;?", "", remainder, flags=re.IGNORECASE)
+        remainder = re.sub(r"\bOut-Null\b;?", "", remainder, flags=re.IGNORECASE)
+
+        residual_tokens = [
+            line.strip() for line in remainder.splitlines()
+            if line.strip() and not line.strip().startswith("#") and line.strip() not in ("{", "}")
+        ]
+
+        if residual_tokens:
+            return TranspilationAssessment(
+                is_transpilable=False,
+                operation=None,
+                rejection_reason=f"Обнаружены нераспознанные инструкции вне файловой операции: {residual_tokens}",
+                raw_command=raw_script
+            )
+
+        if not detected_path:
+            return TranspilationAssessment(
+                is_transpilable=False,
+                operation=None,
+                rejection_reason="Не удалось определить целевой путь файла.",
                 raw_command=raw_script
             )
 
@@ -458,7 +482,6 @@ if sys.platform == "win32":
 
 class IProcessIsolationManager(Protocol):
     def assign_process(self, process_id: int) -> None: ...
-
     def close(self) -> None: ...
 
 
@@ -538,7 +561,7 @@ class Win32JobObjectManager:
 
 
 class PosixProcessGroupManager:
-    """POSIX-реализация изоляции через группы процессов (Process Groups)."""
+    """POSIX-реализация изоляции через группы процессов."""
 
     def __init__(self, limits: JobResourceLimits) -> None:
         self._limits: Final[JobResourceLimits] = limits
@@ -590,7 +613,6 @@ class TrustedRuntimeResolver:
         if not system_root:
             raise PowerShellSecurityException("Критическая переменная окружения SystemRoot не определена.")
 
-        # 1. Приоритет: Современный PowerShell 7+ (pwsh.exe)
         program_files_list = [
             os.environ.get("ProgramFiles", "C:\\Program Files"),
             os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
@@ -600,7 +622,6 @@ class TrustedRuntimeResolver:
             if candidate.is_file():
                 return candidate
 
-        # 2. Системный Windows PowerShell 5.1 в System32
         system32_ps = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
         if system32_ps.is_file():
             return system32_ps
@@ -611,7 +632,7 @@ class TrustedRuntimeResolver:
 
 
 # ============================================================================
-# ЭТАП 3: ЛЕКСИЧЕСКИЙ АУДИТ, ZERO-TRUST ШЛЮЗ И ИЗОЛИРОВАННЫЙ ИСПОЛНИТЕЛЬ (SLOW-PATH)
+# ЭТАП 3: ЛЕКСИЧЕСКИЙ АУДИТ И ZERO-TRUST ШЛЮЗ
 # ============================================================================
 
 @dataclass(frozen=True)
@@ -662,17 +683,13 @@ class StaticScriptAuditor:
     def audit(cls, raw_script: str) -> SecurityAuditReport:
         script_sha256 = hashlib.sha256(raw_script.encode("utf-8", errors="replace")).hexdigest()
 
-        # 1. Удаление однострочных и многострочных комментариев
         clean_script = re.sub(r"<#[\s\S]*?#>", "", raw_script)
         clean_script = re.sub(r"#[^\r\n]*", "", clean_script)
-
-        # 2. Деобфускация обратных апострофов (backticks), применяемых для сокрытия имен команд
         deobfuscated = clean_script.replace("`", "")
 
         violations: List[str] = []
         detected_tokens: List[str] = []
 
-        # 3. Поиск запрещенных команд и псевдонимов по границам слов
         tokens = re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]*\b", deobfuscated)
         for token in tokens:
             token_lower = token.lower()
@@ -681,7 +698,6 @@ class StaticScriptAuditor:
                 violations.append(msg)
                 detected_tokens.append(token)
 
-        # 4. Поиск запрещенных вызовов .NET API, рефлексии и системных операций
         for pattern, description in cls.FORBIDDEN_PATTERNS:
             if pattern.search(deobfuscated):
                 violations.append(f"Обнаружена опасная операция: {description}")
@@ -697,13 +713,14 @@ class StaticScriptAuditor:
 
 
 class ZeroTrustGatekeeper:
-    """Шлюз авторизации выполнения императивных скриптов с блокировкой авто-режима."""
+    """Шлюз авторизации выполнения императивных скриптов."""
 
     @staticmethod
     def verify_execution_permission(
             script: str,
             audit_report: SecurityAuditReport,
-            is_auto: bool
+            is_auto: bool,
+            allow_auto: bool = False
     ) -> bool:
         if not audit_report.is_safe:
             print(f"\n{Colors.RED}{'=' * 60}")
@@ -715,8 +732,9 @@ class ZeroTrustGatekeeper:
                 f"Скрипт отклонен из-за обнаружения запрещенных инструкций: {audit_report.detected_violations}"
             )
 
-        # Блокировка автоматического исполнения императивного кода
         if is_auto:
+            if allow_auto:
+                return True
             print(f"\n{Colors.RED}{'=' * 60}")
             print("ОТКАЗ В АВТО-ИСПОЛНЕНИИ:")
             print(
@@ -727,7 +745,6 @@ class ZeroTrustGatekeeper:
                 "Автоматическое выполнение скриптов PowerShell заблокировано политикой безопасности Zero-Trust."
             )
 
-        # Интерактивное подтверждение человеком (Human-in-the-Loop)
         print(f"\n{Colors.YELLOW}{'=' * 60}")
         print("ТРЕБУЕТСЯ РУЧНОЕ ПОДТВЕРЖДЕНИЕ ВЫПОЛНЕНИЯ POWERSHELL:")
         print(f"Хэш SHA-256: {audit_report.script_sha256}")
@@ -766,7 +783,6 @@ class SandboxedPowerShellRunner:
 
         ephemeral_file = sandbox_dir / f"ps_sandbox_{secrets.token_hex(8)}.ps1"
 
-        # Внедрение принудительного Constrained Language Mode в начало скрипта
         hardened_script = (
                 "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\r\n"
                 + script
@@ -780,7 +796,6 @@ class SandboxedPowerShellRunner:
 
         creation_flags = 0
         if sys.platform == "win32":
-            # Изоляция группы процессов и скрытие консольного окна
             creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x08000000
 
         cmd = [
@@ -855,7 +870,6 @@ class SandboxedPowerShellRunner:
 
     @classmethod
     def _secure_shred_file(cls, path: Path) -> None:
-        """Перезапись содержимого нулями (shredding) перед удалением файла с диска."""
         if not path.exists():
             return
         try:
@@ -872,7 +886,7 @@ class SandboxedPowerShellRunner:
 
 
 # ============================================================================
-# ЭТАП 4: ФАСАД ОРКЕСТРАЦИИ, СИСТЕМА АУДИТА И DTO РЕЗУЛЬТАТОВ
+# ЭТАП 4: ФАСАД ОРКЕСТРАЦИИ
 # ============================================================================
 
 @dataclass(frozen=True)
@@ -906,7 +920,7 @@ class PowerShellSecurityOrchestrator:
             is_auto: bool = False,
             disable_all_except_write: bool = True
     ) -> ScriptExecutionSummary:
-        # Эшелон 1: Детерминированный Fast-Path (нативная запись файлов и создание папок в проекте)
+        # Эшелон 1: Детерминированный Fast-Path (нативная запись файлов и создание папок)
         assessment = ZeroShellTranspiler.assess(raw_script, root_dir)
         if assessment.is_transpilable and assessment.operation is not None:
             start_time = time.time()
@@ -1004,7 +1018,12 @@ class PowerShellSecurityOrchestrator:
 
         # Эшелон 3: Zero-Trust шлюз авторизации
         try:
-            is_permitted = ZeroTrustGatekeeper.verify_execution_permission(raw_script, audit_report, is_auto)
+            is_permitted = ZeroTrustGatekeeper.verify_execution_permission(
+                raw_script,
+                audit_report,
+                is_auto,
+                allow_auto=(not disable_all_except_write)
+            )
         except PolicyViolationError as e:
             return ScriptExecutionSummary(
                 success=False,
@@ -1027,7 +1046,7 @@ class PowerShellSecurityOrchestrator:
                 error_message="Отклонено оператором."
             )
 
-        # Эшелон 4: Изолированный Slow-Path запуск (ConstrainedLanguage + Win32 Job Object)
+        # Эшелон 4: Изолированный Slow-Path запуск
         exec_result = SandboxedPowerShellRunner.execute(raw_script, root_dir)
         is_success = exec_result.exit_code == 0
 
@@ -1197,7 +1216,6 @@ RG_AVAILABLE = shutil.which('rg') is not None
 
 
 def is_comment_line(line: str) -> bool:
-    """Определяет, является ли строка чистым комментарием."""
     s = line.strip()
     if not s:
         return False
@@ -1234,7 +1252,6 @@ def ripgrep_search(search_lines, root_dir='.'):
     except (subprocess.TimeoutExpired, Exception):
         pass
 
-    # Резервный поиск только по строкам кода (если комментарий в блоке был ошибочным)
     code_lines = [l for l in search_lines if not is_comment_line(l) and l.strip()]
     if len(code_lines) >= 2 and len(code_lines) != len([l for l in search_lines if l.strip()]):
         code_pattern = generate_whitespace_agnostic_regex(code_lines)
@@ -1270,7 +1287,6 @@ COUNT_TIME = True
 AUTO_MODE = '-y' in sys.argv or '--auto' in sys.argv
 
 
-# Константы для оформления вывода в консоль
 class Colors:
     RED = '\033[91m'
     GREEN = '\033[92m'
@@ -1278,7 +1294,6 @@ class Colors:
     RESET = '\033[0m'
 
 
-# Папки, которые следует игнорировать при поиске
 IGNORE_DIRS = {
     '.git', 'node_modules', 'venv', '.venv', 'env',
     '__pycache__', '.idea', '.vscode', 'build', 'dist',
@@ -1313,7 +1328,7 @@ def parse_patch_blocks(lines):
             return 'UNDO'
 
     blocks = []
-    state = 0  # 0: поиск <<<<, 1: сбор оригинала (поиск ====), 2: сбор нового текста (поиск >>>>)
+    state = 0
     current_search = []
     current_replace = []
     current_file_hint = None
@@ -1427,13 +1442,10 @@ def is_binary_file(filepath):
     try:
         with open(filepath, 'rb') as f:
             chunk = f.read(1024)
-            # Проверка стандартных BOM для текста
             if chunk.startswith(b'\xff\xfe') or chunk.startswith(b'\xfe\xff') or chunk.startswith(b'\xef\xbb\xbf'):
                 return False
-            # Проверка сигнатуры SQLite
             if chunk.startswith(b'SQLite format 3\x00'):
                 return True
-            # Общая проверка на нулевые байты (бинарники)
             if b'\x00' in chunk:
                 return True
             return False
@@ -1472,7 +1484,6 @@ class TransactionManager:
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for path in file_paths:
                 if os.path.exists(path):
-                    # Сохраняем правильную относительную структуру папок внутри архива
                     rel_path = os.path.relpath(path, start='.')
                     zf.write(path, arcname=rel_path)
         self._cleanup_old()
@@ -1506,7 +1517,6 @@ class TransactionManager:
 
 
 def run_dry_linter(path, content):
-    """Компилирует Python код в памяти. Если есть SyntaxError - возвращает False."""
     if path.endswith('.py'):
         try:
             ast.parse(content)
@@ -1559,7 +1569,6 @@ class CodeIndexer:
                 executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         ''')
-        # Пытаемся использовать сверхбыстрый триграммный поиск, если не выйдет - откатываемся на базовый
         try:
             self.db.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS fts_code USING fts5(path, content, tokenize='trigram');")
@@ -1601,7 +1610,6 @@ class CodeIndexer:
         self.db.commit()
 
     def fts_search(self, search_lines):
-        # Извлекаем слова длиннее 4 символов только из строк кода (игнорируя комментарии)
         words = []
         for line in search_lines:
             if not is_comment_line(line):
@@ -1612,7 +1620,6 @@ class CodeIndexer:
         if not words:
             return None
 
-        # Берем 3 самых длинных уникальных слова из блока кода (наивысшая энтропия)
         words = sorted(list(set(words)), key=len, reverse=True)[:3]
         query = " AND ".join(f'"{w}"' for w in words)
         try:
@@ -1634,7 +1641,6 @@ class CodeIndexer:
         code_file_contents = {}
         other_file_contents = {}
 
-        # Удаление файлов из БД, которых больше нет на диске
         current_paths_set = set(current_files)
         paths_to_delete = [p for p in db_files if p not in current_paths_set]
 
@@ -1656,7 +1662,6 @@ class CodeIndexer:
             except OSError:
                 return None
 
-            # Пропускаем огромные файлы и сам файл БД
             if size > 1 * 1024 * 1024 or file_path == DB_PATH or DB_PATH in file_path:
                 return None
 
@@ -1712,7 +1717,6 @@ class CodeIndexer:
 
             return (file_path, size, mtime, is_bin, enc, newlines, content, needs_read)
 
-        # Распараллеливаем чтение только для измененных файлов
         with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
             results = list(executor.map(process_file, current_files))
 
@@ -1720,7 +1724,6 @@ class CodeIndexer:
             if not res: continue
             file_path, size, mtime, is_bin, enc, newlines, content, needs_read = res
 
-            # Читаем контент из кэша, если файл не менялся
             if not needs_read:
                 if not is_bin:
                     if size < SIZE_THRESHOLD:
@@ -1762,7 +1765,6 @@ class CodeIndexer:
                 else:
                     non_utf8_files.append(file_path)
 
-        # Пакетная вставка (Batch insert) метаданных для максимальной скорости
         if updates:
             for chunk in [updates[i:i + 500] for i in range(0, len(updates), 500)]:
                 self.db.executemany(
@@ -1794,7 +1796,6 @@ class CodeIndexer:
 
 
 def can_contain_block(search_lines, f_text):
-    # Отбираем только значимые строки кода, исключая чистые комментарии
     code_lines = [l.strip() for l in search_lines if len(l.strip()) > 6 and not is_comment_line(l)]
     target_lines = code_lines if code_lines else [l.strip() for l in search_lines if len(l.strip()) > 6]
     if not target_lines:
@@ -1805,14 +1806,12 @@ def can_contain_block(search_lines, f_text):
         if line in f_text:
             return True
 
-    # Проверка с нормализацией повторяющихся пробелов
     f_text_collapsed = re.sub(r'[ \t]+', ' ', f_text)
     for line in longest_lines:
         line_collapsed = re.sub(r'[ \t]+', ' ', line)
         if line_collapsed in f_text_collapsed:
             return True
 
-    # Проверка по идентификаторам кода
     for line in longest_lines:
         tokens = [t for t in re.findall(r'[a-zA-Z0-9_]{5,}', line) if
                   t.lower() not in ('return', 'const', 'function', 'import', 'export')]
@@ -1829,10 +1828,6 @@ def get_fuzzy_ratio(s1, s2):
 
 
 def adjust_comment_boundaries(search_lines, file_lines, start, end):
-    """
-    Корректирует границы start и end для сопоставления внешних комментариев,
-    гарантируя, что соседние строки чужого кода никогда не будут затерты.
-    """
     s_clean = [l for l in search_lines if l.strip()]
     if not s_clean:
         return start, end
@@ -1964,7 +1959,6 @@ def find_anchors_match(search_lines, file_lines):
     while search_lines and trailing < len(search_lines) and not search_lines[-(trailing + 1)].strip():
         trailing += 1
 
-    # Ищем якорь среди строк кода, пропуская внешние комментарии при необходимости
     anchor_offset = 0
     while anchor_offset < len(s_norm) and is_comment_line(s_norm[anchor_offset]):
         anchor_offset += 1
@@ -2115,7 +2109,6 @@ def find_fuzzy_block(search_lines, file_lines, threshold=0.85):
     if candidates:
         return candidates
 
-    # Резервный проход: нечеткий поиск только строк кода (если размер окна искажен отсутствующим комментарием)
     code_norm = [l for l in s_norm if not is_comment_line(l) and l]
     if len(code_norm) >= 2 and len(code_norm) < len(s_norm):
         cands_code = _fuzzy_slide_window(code_norm, f_norm, file_lines, 0, 0, threshold)
@@ -2152,7 +2145,6 @@ def extract_powershell_commands(lines: List[str]) -> List[ScriptBlockPayload]:
     while i < len(lines):
         stripped = lines[i].strip()
 
-        # 1. Поиск блоков powershell в markdown
         if stripped.lower() in ["```powershell", "```ps1", "```ps"]:
             start_idx = i + 1
             i += 1
@@ -2163,13 +2155,11 @@ def extract_powershell_commands(lines: List[str]) -> List[ScriptBlockPayload]:
                 if cmd.strip():
                     commands.append(ScriptBlockPayload(command=cmd, start_line=start_idx + 1, end_line=i))
 
-        # 2. Поиск блоков $content = @'
         elif stripped.startswith("$content = @'") or stripped.startswith("$content=@'"):
             start_idx = i
             i += 1
             while i < len(lines) and not lines[i].strip().startswith("'@"):
                 i += 1
-            # Захватываем последующие команды файловой записи
             while i < len(lines) and not any(
                     kw in lines[i] for kw in ["Out-File", "Set-Content", "WriteAllText", "AppendAllText"]):
                 i += 1
@@ -2244,7 +2234,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
                     f"{Colors.RED}Прерывание работы из-за отказа в исполнении PowerShell команды {idx}:{Colors.RESET}")
                 if summary.error_message:
                     print(f"{Colors.RED}{summary.error_message}{Colors.RESET}")
-                if summary.stderr:
+                if summary.stderr and summary.stderr != summary.error_message:
                     print(f"{Colors.YELLOW}{summary.stderr}{Colors.RESET}")
                 return False
             else:
@@ -2264,7 +2254,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
     file_contents, file_encodings, non_utf8_files, code_file_contents, other_file_contents = indexer.sync_and_read(
         ignore_folders, ignore_files, prompt_filenames)
 
-    # 2. Поиск совпадений
     block_matches = []
     already_applied_blocks = {}
     user_skipped_blocks = set()
@@ -2293,7 +2282,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
                     cands.append({'path': path, 'start': m[0], 'end': m[1], 'ratio': 1.0})
                 continue
 
-            # Резервный точный поиск только строк кода (без внешних комментариев)
             code_only_lines = [l for l in search_lines if not is_comment_line(l) and l.strip()]
             if len(code_only_lines) >= 2 and len(code_only_lines) < len([l for l in search_lines if l.strip()]):
                 code_matches = find_matches(code_only_lines, lines)
@@ -2327,7 +2315,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             block_matches.append([])
             continue
 
-        # Поиск потенциальных кандидатов сначала в файлах кода с FTS-фильтрацией
         candidates = get_candidates(search_lines, code_file_contents, use_fts=True)
 
         if not candidates and other_file_contents:
@@ -2345,7 +2332,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             if ans in ['y', 'yes', 'да', '1']:
                 candidates = get_candidates(search_lines, other_file_contents, use_fts=False)
 
-        # Если FTS пропустил нужный файл, делаем резервный поиск без FTS
         if not candidates and code_file_contents:
             candidates = get_candidates(search_lines, code_file_contents, use_fts=False)
 
@@ -2365,7 +2351,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
                         newly_read[f] = lines
                         non_utf8_files.remove(f)
 
-                        # Распределяем файлы по категориям для будущих блоков
                         if os.path.splitext(f)[1].lower() in CODE_EXTENSIONS or not os.path.splitext(f)[1]:
                             code_file_contents[f] = lines
                         else:
@@ -2377,7 +2362,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             if newly_read:
                 candidates = get_candidates(search_lines, newly_read, use_fts=False)
 
-        # Приоритизация/фильтрация кандидатов по подсказке имени файла из промпта
         if file_hint and candidates:
             hint_norm = os.path.normpath(file_hint).lower()
             hint_base = os.path.basename(hint_norm)
@@ -2393,10 +2377,8 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             if hint_matched:
                 candidates = hint_matched
 
-        # Сортировка по совпадению (сначала наиболее похожие)
         candidates.sort(key=lambda x: x['ratio'], reverse=True)
 
-        # Если найдено точное совпадение (ratio > 0.999), берем его без лишних вопросов
         exact_candidates = [c for c in candidates if c['ratio'] >= 0.999]
         if exact_candidates:
             if len(exact_candidates) > 1 and prompt_filenames:
@@ -2414,7 +2396,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             for ec in exact_candidates:
                 matches_for_block.append((ec['path'], ec['start'], ec['end']))
         else:
-            # Иначе запрашиваем подтверждение для лучших нечетких совпадений
             for cand in candidates:
                 path = cand['path']
                 start = cand['start']
@@ -2430,7 +2411,7 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
                 print(f"Сходство кода: {stats['char_similarity_pct']:.1f}%")
                 print(f"несоответствует символов: {stats['mismatched_chars']} ({stats['char_mismatch_pct']:.1f}%)")
                 print(f"несоответствует строк: {stats['mismatched_lines']} ({stats['line_mismatch_pct']:.1f}%)")
-                # Показ подробностей разницы
+
                 s_norm = [l.strip() for l in search_lines]
                 c_norm = [l.strip() for l in candidate_lines]
                 line_matcher = difflib.SequenceMatcher(None, s_norm, c_norm)
@@ -2498,7 +2479,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             if len(replace_lines) >= 3:
                 applied_locs = []
                 for path, lines in file_contents.items():
-                    # Проверяем, есть ли уже блок замены в каком-либо файле
                     non_empty_replace = [l for l in replace_lines if l.strip()]
                     found_replacements = find_matches(non_empty_replace, lines) if non_empty_replace else []
                     for m in found_replacements:
@@ -2506,12 +2486,10 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
                 if applied_locs:
                     already_applied_blocks[idx] = applied_locs
             else:
-                # Если блок замены пустой, а блок поиска не найден, возможно он уже удален
                 already_applied_blocks[idx] = []
 
         block_matches.append(matches_for_block)
 
-    # 3. Валидация
     errors = []
     missing_blocks = 0
     duplicate_blocks = 0
@@ -2554,7 +2532,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             errors.append(err_msg)
             missing_blocks += 1
         elif len(matches) > 1:
-            # Попытка устранить неоднозначность по подсказкам файлов из промпта
             if prompt_filenames:
                 filtered_matches = []
                 for p, s, e in matches:
@@ -2615,11 +2592,9 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             print(f"\n{Colors.YELLOW}Время выполнения: {elapsed:.2f} сек.{Colors.RESET}")
         return False
 
-    # 4. Применение правок
     file_modifications = {f: [] for f in file_contents}
     for idx, matches in enumerate(block_matches):
         if not matches:
-            # Пропускаем блоки, которые не были найдены (или уже были применены)
             continue
 
         for match in matches:
@@ -2634,7 +2609,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
     files_changed = 0
     pending_replacements = []
 
-    # Первый проход: формирование всех файлов в памяти и запись во временные файлы (.tmp)
     for path, mods in file_modifications.items():
         if not mods:
             continue
@@ -2646,10 +2620,8 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             start = mod['start']
             end = mod['end']
             replace_lines = mod['replace']
-
             lines = lines[:start] + replace_lines + lines[end:]
 
-        # Запись во временный словарь (в памяти)
         try:
             enc_info = file_encodings.get(path, ('utf-8', '\n'))
             if isinstance(enc_info, tuple):
@@ -2680,7 +2652,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
             print(f"{Colors.RED}Ошибка при подготовке файла {path}: {e}{Colors.RESET}")
             return False
 
-    # Второй проход: Машина Времени (бэкап) и Атомарная перезапись (Batch VFS)
     tm = TransactionManager()
     try:
         changed_paths = [d[0] for d in pending_replacements]
@@ -2691,7 +2662,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
         print(f"{Colors.RED}Ошибка создания резервной копии: {e}{Colors.RESET}")
         return False
 
-    # Проверка линтером перед записью (последовательно, чтобы можно было взаимодействовать с пользователем)
     for d in pending_replacements:
         path, lines, enc, newline_char = d
         content = newline_char.join(lines) + newline_char
@@ -2717,8 +2687,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
     def safe_atomic_write(file_data):
         path, lines, enc, newline_char = file_data
         content = newline_char.join(lines) + newline_char
-
-        # Атомарная запись через .tmp файл
         tmp_path = path + ".tmp_write"
         with open(tmp_path, 'w', encoding=enc, newline='') as f:
             f.write(content)
@@ -2733,7 +2701,6 @@ def main(ignore_folders=None, ignore_files=None, input_lines=None, auto_mode=Fal
                 print(f"Обновлен файл: {Colors.YELLOW}{path}{Colors.RESET}")
                 files_changed += 1
 
-        # Маркируем успешные патчи как примененные в БД SQLite
         for idx, matches in enumerate(block_matches):
             if matches:
                 p_hash = indexer.get_patch_hash(blocks[idx]['search'], blocks[idx]['replace'])
@@ -2766,7 +2733,6 @@ def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, 
     effective_auto = auto_mode or AUTO_MODE or skip_clipboard_confirm
 
     if check_clipboard:
-        # Проверка: запущен ли в системе другой replacer с check_clipboard=True
         active_proc = check_active_clipboard_process()
         if active_proc:
             print(f"\n{Colors.RED}{'=' * 60}")
@@ -2835,4 +2801,12 @@ def run_replacer(ignore_folders=None, ignore_files=None, check_clipboard=False, 
 
 
 if __name__ == '__main__':
-    run_replacer()
+    ignore_folders = list(IGNORE_DIRS)
+    ignore_file_list = [DB_PATH, CLIPBOARD_LOCK_FILE]
+    run_replacer(
+        ignore_folders=ignore_folders,
+        ignore_files=ignore_file_list,
+        check_clipboard=True,
+        skip_clipboard_confirm=True,
+        disable_all_except_write=False
+    )

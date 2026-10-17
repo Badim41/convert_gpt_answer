@@ -172,3 +172,18 @@ if not report.success:
 else:
     print(f"Успешно! Изменены файлы: {report.modified_files}, созданы: {report.created_files}")
 ```
+
+### .gitignore
+
+Укажите во избежания утечек секретов:
+```
+# search-replace utils
+
+secret.py
+replacer.py
+get_structure.py
+.get_gpt_project
+.deepsearch
+.deepsearch.db
+prompt_for_project.txt
+```

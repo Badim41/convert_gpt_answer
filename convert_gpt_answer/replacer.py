@@ -1855,17 +1855,22 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
 
     recent_lines: List[str] = []
     closing_marker = end_marker
+    mid_line_re = re.compile(r"^[ \t]{0,3}=" + r"{4,12}[ \t]*$")
+    start_line_re = re.compile(r"^[ \t]{0,3}<" + r"{4,12}(?:[ \t]+.*)?$")
+    end_line_re = re.compile(r"^[ \t]{0,3}>" + r"{4,12}(?:[ \t]+.*)?$")
 
     for line in lines:
-        stripped = line.strip()
+        line_no_nl = line.rstrip("\r\n")
+        stripped = line_no_nl.strip()
 
-        is_start_normal = stripped.startswith(start_marker)
-        is_start_inverted = stripped.startswith(end_marker)
-        is_mid = stripped.startswith(mid_marker)
+        is_start_normal = bool(start_line_re.match(line_no_nl))
+        is_start_inverted = bool(end_line_re.match(line_no_nl))
+        is_mid = bool(mid_line_re.match(line_no_nl))
+        is_closing = is_start_inverted if closing_marker == end_marker else is_start_normal
 
         if state == 0:
             if is_start_normal:
-                if re.match(r"^" + re.escape(start_marker) + r"\s*create:?\s+", stripped, re.IGNORECASE):
+                if re.match(r"^" + re.escape(start_marker) + r"+\s*create:?\s+", stripped, re.IGNORECASE):
                     state = 3
                     continue
                 header_tail = stripped.lstrip("<").strip()
@@ -1888,12 +1893,12 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
         elif state == 1:
             if is_mid:
                 state = 2
-            elif stripped.startswith(closing_marker):
+            elif is_closing:
                 state = 0
-            elif not stripped.startswith(start_marker) and not stripped.startswith(end_marker):
-                current_search.append(line.rstrip("\r\n"))
+            elif not is_start_normal and not is_start_inverted:
+                current_search.append(line_no_nl)
         elif state == 2:
-            if stripped.startswith(closing_marker):
+            if is_closing:
                 blocks.append({
                     "search": trim_lines_search(current_search),
                     "replace": current_replace,
@@ -1902,12 +1907,12 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
                 state = 0
                 current_file_hint = None
                 recent_lines = []
-            elif not is_mid and not stripped.startswith(start_marker) and not stripped.startswith(end_marker):
-                current_replace.append(line.rstrip("\r\n"))
+            elif not (is_mid and not current_replace):
+                current_replace.append(line_no_nl)
         elif state == 3:
-            if re.match(r"^" + re.escape(start_marker) + r"\s*create:?\s+", stripped, re.IGNORECASE):
+            if re.match(r"^" + re.escape(start_marker) + r"+\s*create:?\s+", stripped, re.IGNORECASE):
                 state = 3
-            elif stripped.startswith(end_marker):
+            elif is_start_inverted:
                 state = 0
 
     if state == 2:

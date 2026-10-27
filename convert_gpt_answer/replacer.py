@@ -192,6 +192,7 @@ class ExecutionStrategy(str, Enum):
     NATIVE_TRANSPILATION = "NATIVE_TRANSPILATION"
     ISOLATED_POWERSHELL = "ISOLATED_POWERSHELL"
     DIRECT_POWERSHELL = "DIRECT_POWERSHELL"
+    DIRECT_CMD = "DIRECT_CMD"
     REJECTED = "REJECTED"
 
 
@@ -244,6 +245,7 @@ class ScriptBlockPayload:
     command: str
     start_line: int
     end_line: int
+    shell_type: str = "powershell"
 
 
 @dataclass(frozen=True)
@@ -399,14 +401,7 @@ class SecurePathResolver:
         else:
             resolved_target = (resolved_root / candidate_path).resolve()
 
-        try:
-            resolved_target.relative_to(resolved_root)
-        except ValueError:
-            raise PathTraversalSecurityError(
-                f"Попытка выхода за пределы корня проекта: {raw_path!r} -> {resolved_target}"
-            )
-
-        for part in resolved_target.relative_to(resolved_root).parts:
+        for part in resolved_target.parts:
             stem_lower = Path(part).stem.lower()
             if stem_lower in SecurePathResolver.RESERVED_DEVICE_NAMES:
                 raise PathTraversalSecurityError(
@@ -1174,17 +1169,23 @@ class SandboxedPowerShellRunner:
         if not raw:
             return ""
 
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+
         if sys.platform == "win32":
             try:
                 oem_cp = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
                 return raw.decode(oem_cp)
             except Exception:
                 pass
+            try:
+                return raw.decode("cp1251")
+            except Exception:
+                pass
 
-        try:
-            return raw.decode("utf-8")
-        except UnicodeDecodeError:
-            return raw.decode("latin-1", errors="replace")
+        return raw.decode("latin-1", errors="replace")
 
     @classmethod
     def _secure_shred_file(cls, path: Path) -> None:
@@ -1204,7 +1205,7 @@ class SandboxedPowerShellRunner:
 
 
 class DirectPowerShellRunner:
-    """Прямой запуск PowerShell в рабочей директории проекта (только при явном флаге unsafe_direct_ps)."""
+    """Прямой запуск PowerShell в рабочей директории проекта."""
 
     @classmethod
     def execute(cls, script: str, root_dir: Path) -> SlowPathExecutionResult:
@@ -1238,7 +1239,7 @@ class DirectPowerShellRunner:
                 cwd=str(root_dir.resolve()),
                 creationflags=creation_flags
             )
-            raw_stdout, raw_stderr = process.communicate(timeout=30.0)
+            raw_stdout, raw_stderr = process.communicate(timeout=120.0)
             exit_code = process.returncode
         except Exception as e:
             raw_stderr = str(e).encode("utf-8")
@@ -1262,8 +1263,81 @@ class DirectPowerShellRunner:
         )
 
 
+class DirectCmdRunner:
+    """Прямой запуск команд CMD / Batch в рабочей директории проекта."""
+
+    @classmethod
+    def execute(cls, script: str, root_dir: Path) -> SlowPathExecutionResult:
+        temp_dir = Path(tempfile.gettempdir())
+        ephemeral_file = temp_dir / f"cmd_direct_{secrets.token_hex(8)}.cmd"
+
+        normalized_body = script.replace("\r\n", "\n").replace("\n", "\r\n")
+        cmd_content = "@echo off\r\nchcp 65001 >nul\r\n" + normalized_body + "\r\n"
+
+        with open(ephemeral_file, "w", encoding="utf-8", newline="") as f:
+            f.write(cmd_content)
+
+        start_time = time.time()
+        if sys.platform == "win32":
+            comspec = os.environ.get("ComSpec", "C:\\Windows\\System32\\cmd.exe")
+            cmd = [comspec, "/d", "/c", str(ephemeral_file.resolve())]
+            creation_flags = 0x08000000
+        else:
+            cmd = ["/bin/sh", str(ephemeral_file.resolve())]
+            creation_flags = 0
+
+        raw_stdout = b""
+        raw_stderr = b""
+        exit_code = -1
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=str(root_dir.resolve()),
+                creationflags=creation_flags
+            )
+            raw_stdout, raw_stderr = process.communicate(timeout=120.0)
+            exit_code = process.returncode
+        except Exception as e:
+            raw_stderr = str(e).encode("utf-8")
+            exit_code = 1
+        finally:
+            if ephemeral_file.exists():
+                try:
+                    ephemeral_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        duration = time.time() - start_time
+        stdout_str = SandboxedPowerShellRunner._decode_stream(raw_stdout)
+        stderr_str = SandboxedPowerShellRunner._decode_stream(raw_stderr)
+
+        return SlowPathExecutionResult(
+            exit_code=exit_code,
+            stdout=stdout_str,
+            stderr=stderr_str,
+            duration_seconds=duration
+        )
+
+
+def prompt_strict_yes_no(prompt_text: str) -> bool:
+    """Строгий запрос подтверждения (y/n) без автоподтверждения через Enter."""
+    while True:
+        try:
+            ans = input(prompt_text).strip().lower()
+        except EOFError:
+            return False
+        if ans in ("y", "yes", "да"):
+            return True
+        if ans in ("n", "no", "нет"):
+            return False
+        print(f"{Colors.YELLOW}Введите явно 'y' (да) или 'n' (нет). Подтверждение через Enter отключено.{Colors.RESET}")
+
+
 # ============================================================================
-# ЭТАП 4: ИСПРАВЛЕННЫЙ ФАСАД ОРКЕСТРАЦИИ POWERSHELL
+# ЭТАП 4: ИСПРАВЛЕННЫЙ ФАСАД ОРКЕСТРАЦИИ POWERSHELL И CMD
 # ============================================================================
 
 def run_dry_linter(path: str, content: str) -> Tuple[bool, str]:
@@ -1283,188 +1357,105 @@ def run_dry_linter(path: str, content: str) -> Tuple[bool, str]:
 
 
 class PowerShellSecurityOrchestrator:
-    """Единая точка входа для безопасной диспетчеризации PowerShell-скриптов."""
+    """Единая точка входа для диспетчеризации команд PowerShell и CMD."""
 
     @classmethod
-    def dispatch(
+    def _try_native_transpile(
         cls,
         raw_script: str,
         root_dir: Path,
         tm: "TransactionManager",
-        indexer: Optional["CodeIndexer"] = None,
-        is_auto: bool = False,
-        disable_all_except_write: bool = True,
-        unsafe_direct_ps: bool = False,
-        quiet: bool = False
-    ) -> ScriptExecutionSummary:
-        # Эшелон 1: Детерминированный Fast-Path (нативная запись файлов и создание папок)
+        indexer: Optional["CodeIndexer"]
+    ) -> Optional[ScriptExecutionSummary]:
         assessment = ZeroShellTranspiler.assess(raw_script, root_dir)
-        if assessment.is_transpilable and assessment.operation is not None:
-            start_time = time.time()
-            target_path = assessment.operation.target_path
-            was_new = not target_path.exists()
+        if not (assessment.is_transpilable and assessment.operation is not None):
+            return None
 
-            # Проверка синтаксиса записываемого файла ДО записи на диск
-            if assessment.operation.mode == FileWriteMode.OVERWRITE:
-                is_valid, lint_err = run_dry_linter(str(target_path), assessment.operation.content)
-                if not is_valid:
-                    return ScriptExecutionSummary(
-                        success=False,
-                        strategy=ExecutionStrategy.NATIVE_TRANSPILATION,
-                        exit_code=1,
-                        duration_seconds=time.time() - start_time,
-                        stdout="",
-                        stderr=lint_err,
-                        error_message=f"Проверка линтера не пройдена для {target_path.name}: {lint_err}",
-                        target_path=str(target_path),
-                        was_new_file=was_new
-                    )
+        start_time = time.time()
+        target_path = assessment.operation.target_path
+        was_new = not target_path.exists()
 
-            try:
-                if assessment.operation.mode != FileWriteMode.MKDIR:
-                    tm.backup_files([str(target_path)])
-
-                ZeroShellTranspiler.execute_operation(assessment.operation)
-                elapsed = time.time() - start_time
-
-                script_hash = hashlib.sha256(raw_script.encode("utf-8", errors="replace")).hexdigest()
-                if indexer is not None:
-                    indexer.record_powershell_audit(
-                        script_hash=script_hash,
-                        strategy=ExecutionStrategy.NATIVE_TRANSPILATION.value,
-                        exit_code=0,
-                        duration_seconds=elapsed
-                    )
-
-                op_desc = (
-                    "Папка успешно создана"
-                    if assessment.operation.mode == FileWriteMode.MKDIR
-                    else "Файл атомарно записан"
-                )
-                return ScriptExecutionSummary(
-                    success=True,
-                    strategy=ExecutionStrategy.NATIVE_TRANSPILATION,
-                    exit_code=0,
-                    duration_seconds=elapsed,
-                    stdout=f"{op_desc} нативным транслятором: {target_path}",
-                    stderr="",
-                    error_message=None,
-                    target_path=str(target_path),
-                    was_new_file=was_new
-                )
-            except Exception as e:
-                elapsed = time.time() - start_time
+        if assessment.operation.mode == FileWriteMode.OVERWRITE:
+            is_valid, lint_err = run_dry_linter(str(target_path), assessment.operation.content)
+            if not is_valid:
                 return ScriptExecutionSummary(
                     success=False,
                     strategy=ExecutionStrategy.NATIVE_TRANSPILATION,
                     exit_code=1,
-                    duration_seconds=elapsed,
+                    duration_seconds=time.time() - start_time,
                     stdout="",
-                    stderr=str(e),
-                    error_message=f"Ошибка нативной файловой операции: {e}",
+                    stderr=lint_err,
+                    error_message=f"Проверка линтера не пройдена для {target_path.name}: {lint_err}",
                     target_path=str(target_path),
                     was_new_file=was_new
                 )
 
-        # Если скрипт не транспилируется в простую запись файла/создание папки:
-        if disable_all_except_write:
-            if is_auto:
-                err_msg = (
-                    f"ОТКАЗ (disable_all_except_write=True): Разрешены только операции записи файлов "
-                    f"и создания папок в директории проекта. Причина отклонения Fast-Path: "
-                    f"{assessment.rejection_reason or 'Императивный скрипт'}"
-                )
-                return ScriptExecutionSummary(
-                    success=False,
-                    strategy=ExecutionStrategy.REJECTED,
-                    exit_code=1,
-                    duration_seconds=0.0,
-                    stdout="",
-                    stderr=err_msg,
-                    error_message=err_msg
-                )
-
-            if not quiet:
-                print(f"\n{Colors.YELLOW}{'=' * 60}")
-                print("ВНИМАНИЕ: Скрипт не является простой операцией записи файлов или создания папок.")
-                print("Активно правило безопасности: disable_all_except_write = True.")
-                print(f"Причина отклонения Fast-Path: {assessment.rejection_reason}")
-                print(f"{'-' * 60}{Colors.RESET}")
-                print(raw_script.strip()[:600] + ("\n... [обрезано]" if len(raw_script.strip()) > 600 else ""))
-                print(f"{Colors.YELLOW}{'=' * 60}{Colors.RESET}")
-
-            try:
-                answer = input(
-                    "Команда выходит за рамки записи файлов/создания папок. Продолжить проверку в песочнице? [y/N]: "
-                ).strip().lower()
-                if answer not in ["y", "yes", "да", "1"]:
-                    return ScriptExecutionSummary(
-                        success=False,
-                        strategy=ExecutionStrategy.REJECTED,
-                        exit_code=1,
-                        duration_seconds=0.0,
-                        stdout="",
-                        stderr="Выполнение скрипта отклонено оператором (disable_all_except_write).",
-                        error_message="Отклонено оператором (disable_all_except_write)."
-                    )
-            except EOFError:
-                return ScriptExecutionSummary(
-                    success=False,
-                    strategy=ExecutionStrategy.REJECTED,
-                    exit_code=1,
-                    duration_seconds=0.0,
-                    stdout="",
-                    stderr="Прервано: отсутствие интерактивного ввода.",
-                    error_message="Прервано: отсутствие ввода."
-                )
-
-        # Эшелон 2: Статический лексический аудит безопасности (ВСЕГДА выполняется!)
-        audit_report = StaticScriptAuditor.audit(raw_script)
-
-        # Эшелон 3: Zero-Trust шлюз авторизации
         try:
-            is_permitted = ZeroTrustGatekeeper.verify_execution_permission(
-                raw_script,
-                audit_report,
-                is_auto=is_auto,
-                allow_auto=(not disable_all_except_write),
-                quiet=quiet
+            if assessment.operation.mode != FileWriteMode.MKDIR:
+                tm.backup_files([str(target_path)])
+
+            ZeroShellTranspiler.execute_operation(assessment.operation)
+            elapsed = time.time() - start_time
+
+            script_hash = hashlib.sha256(raw_script.encode("utf-8", errors="replace")).hexdigest()
+            if indexer is not None:
+                indexer.record_powershell_audit(
+                    script_hash=script_hash,
+                    strategy=ExecutionStrategy.NATIVE_TRANSPILATION.value,
+                    exit_code=0,
+                    duration_seconds=elapsed
+                )
+
+            op_desc = (
+                "Папка успешно создана"
+                if assessment.operation.mode == FileWriteMode.MKDIR
+                else "Файл атомарно записан"
             )
-        except PolicyViolationError as e:
+            return ScriptExecutionSummary(
+                success=True,
+                strategy=ExecutionStrategy.NATIVE_TRANSPILATION,
+                exit_code=0,
+                duration_seconds=elapsed,
+                stdout=f"{op_desc} нативным транслятором: {target_path}",
+                stderr="",
+                error_message=None,
+                target_path=str(target_path),
+                was_new_file=was_new
+            )
+        except Exception as e:
+            elapsed = time.time() - start_time
             return ScriptExecutionSummary(
                 success=False,
-                strategy=ExecutionStrategy.REJECTED,
+                strategy=ExecutionStrategy.NATIVE_TRANSPILATION,
                 exit_code=1,
-                duration_seconds=0.0,
+                duration_seconds=elapsed,
                 stdout="",
                 stderr=str(e),
-                error_message=str(e)
+                error_message=f"Ошибка нативной файловой операции: {e}",
+                target_path=str(target_path),
+                was_new_file=was_new
             )
 
-        if not is_permitted:
-            return ScriptExecutionSummary(
-                success=False,
-                strategy=ExecutionStrategy.REJECTED,
-                exit_code=1,
-                duration_seconds=0.0,
-                stdout="",
-                stderr="Исполнение PowerShell отклонено пользователем.",
-                error_message="Отклонено оператором."
-            )
-
-        # Эшелон 4: Изолированный запуск в песочнице (или Direct только при явном unsafe_direct_ps)
-        if unsafe_direct_ps:
+    @classmethod
+    def _run_shell_direct(
+        cls,
+        raw_script: str,
+        root_dir: Path,
+        indexer: Optional["CodeIndexer"],
+        shell_type: str
+    ) -> ScriptExecutionSummary:
+        if shell_type.lower() == "cmd":
+            exec_result = DirectCmdRunner.execute(raw_script, root_dir)
+            chosen_strategy = ExecutionStrategy.DIRECT_CMD
+        else:
             exec_result = DirectPowerShellRunner.execute(raw_script, root_dir)
             chosen_strategy = ExecutionStrategy.DIRECT_POWERSHELL
-        else:
-            exec_result = SandboxedPowerShellRunner.execute(raw_script, root_dir)
-            chosen_strategy = ExecutionStrategy.ISOLATED_POWERSHELL
 
         is_success = exec_result.exit_code == 0
-
+        script_hash = hashlib.sha256(raw_script.encode("utf-8", errors="replace")).hexdigest()
         if indexer is not None:
             indexer.record_powershell_audit(
-                script_hash=audit_report.script_sha256,
+                script_hash=script_hash,
                 strategy=chosen_strategy.value,
                 exit_code=exec_result.exit_code,
                 duration_seconds=exec_result.duration_seconds
@@ -1477,8 +1468,94 @@ class PowerShellSecurityOrchestrator:
             duration_seconds=exec_result.duration_seconds,
             stdout=exec_result.stdout,
             stderr=exec_result.stderr,
-            error_message=None if is_success else f"Скрипт завершился с кодом ошибки {exec_result.exit_code}"
+            error_message=None if is_success else f"Команда завершилась с кодом ошибки {exec_result.exit_code}"
         )
+
+    @classmethod
+    def dispatch(
+        cls,
+        raw_script: str,
+        root_dir: Path,
+        tm: "TransactionManager",
+        indexer: Optional["CodeIndexer"] = None,
+        is_auto: bool = False,
+        disable_all_except_write: Optional[bool] = None,
+        unsafe_direct_ps: bool = False,
+        quiet: bool = False,
+        shell_type: str = "powershell"
+    ) -> ScriptExecutionSummary:
+        shell_label = "CMD" if shell_type.lower() == "cmd" else "PowerShell"
+
+        # Режим по умолчанию (disable_all_except_write is None):
+        # Запрашиваем каждую команду отдельно (y/n - без автоподтверждения через Enter)
+        if disable_all_except_write is None:
+            if not quiet:
+                print(f"\n{Colors.YELLOW}{'=' * 60}")
+                print(f"ЗАПРОС НА ВЫПОЛНЕНИЕ КОМАНДЫ ({shell_label}):")
+                print(f"{'-' * 60}{Colors.RESET}")
+                print(raw_script.strip())
+                print(f"{Colors.YELLOW}{'=' * 60}{Colors.RESET}")
+
+            is_confirmed = prompt_strict_yes_no(f"Выполнить эту команду ({shell_label})? (y/n): ")
+            if not is_confirmed:
+                return ScriptExecutionSummary(
+                    success=True,
+                    strategy=ExecutionStrategy.REJECTED,
+                    exit_code=0,
+                    duration_seconds=0.0,
+                    stdout="Команда пропущена пользователем.",
+                    stderr="",
+                    error_message=None
+                )
+
+            if shell_type.lower() != "cmd":
+                transpiled = cls._try_native_transpile(raw_script, root_dir, tm, indexer)
+                if transpiled is not None:
+                    return transpiled
+
+            return cls._run_shell_direct(raw_script, root_dir, indexer, shell_type)
+
+        # Если disable_all_except_write is True или False — сначала проверяем нативную запись файлов
+        if shell_type.lower() != "cmd":
+            transpiled = cls._try_native_transpile(raw_script, root_dir, tm, indexer)
+            if transpiled is not None:
+                return transpiled
+
+        if disable_all_except_write is True:
+            err_msg = (
+                f"ОТКАЗ (disable_all_except_write=True): Разрешены только операции записи файлов "
+                f"и создания папок."
+            )
+            return ScriptExecutionSummary(
+                success=False,
+                strategy=ExecutionStrategy.REJECTED,
+                exit_code=1,
+                duration_seconds=0.0,
+                stdout="",
+                stderr=err_msg,
+                error_message=err_msg
+            )
+
+        # disable_all_except_write is False:
+        if not is_auto:
+            if not quiet:
+                print(f"\n{Colors.YELLOW}{'=' * 60}")
+                print(f"ПОДТВЕРЖДЕНИЕ ВЫПОЛНЕНИЯ КОМАНДЫ ({shell_label}):")
+                print(f"{'-' * 60}{Colors.RESET}")
+                print(raw_script.strip())
+                print(f"{Colors.YELLOW}{'=' * 60}{Colors.RESET}")
+            if not prompt_strict_yes_no(f"Выполнить эту команду ({shell_label})? (y/n): "):
+                return ScriptExecutionSummary(
+                    success=True,
+                    strategy=ExecutionStrategy.REJECTED,
+                    exit_code=0,
+                    duration_seconds=0.0,
+                    stdout="Команда пропущена пользователем.",
+                    stderr="",
+                    error_message=None
+                )
+
+        return cls._run_shell_direct(raw_script, root_dir, indexer, shell_type)
 
 
 # ============================================================================
@@ -1638,13 +1715,17 @@ def has_actionable_markers(text: str) -> bool:
         return True
     if start_tag in text and end_tag in text and re.search(r"create\s*:", text, re.IGNORECASE):
         return True
+    lower_text = text.lower()
     if (
         "$content = @'" in text
         or "$content=@'" in text
         or '$content = @"' in text
-        or "```powershell" in text.lower()
-        or "```ps1" in text.lower()
-        or "```ps" in text.lower()
+        or "```powershell" in lower_text
+        or "```ps1" in lower_text
+        or "```ps" in lower_text
+        or "```cmd" in lower_text
+        or "```bat" in lower_text
+        or "```batch" in lower_text
         or re.search(r"^\s*(?:mkdir|md)\s+", text, re.MULTILINE | re.IGNORECASE)
         or re.search(r"^\s*New-Item\s+", text, re.MULTILINE | re.IGNORECASE)
         or "[System.IO." in text
@@ -1713,6 +1794,74 @@ def ripgrep_search(search_lines: List[str], root_dir: str = ".") -> Optional[Set
             except (subprocess.TimeoutExpired, Exception):
                 pass
     return None
+
+
+def _trim_empty_border_lines(lines: List[str]) -> List[str]:
+    s, e = 0, len(lines)
+    while s < e and not lines[s].strip():
+        s += 1
+    while e > s and not lines[e - 1].strip():
+        e -= 1
+    return lines[s:e]
+
+
+def is_match_already_superseded(
+    file_lines: List[str],
+    match_start: int,
+    match_end: int,
+    search_lines: List[str],
+    replace_lines: List[str]
+) -> bool:
+    """
+    Проверяет, не является ли найденное вхождение search_lines (match_start..match_end)
+    частью УЖЕ примененного блока replace_lines (например, когда replace_lines дописывает
+    новый код после или перед search_lines).
+    """
+    s_norm = [l.strip() for l in _trim_empty_border_lines(search_lines)]
+    r_norm = [l.strip() for l in _trim_empty_border_lines(replace_lines)]
+    n_s = len(s_norm)
+    n_r = len(r_norm)
+    if n_s == 0 or n_r < n_s or s_norm == r_norm:
+        return False
+
+    f_norm = [l.strip() for l in file_lines]
+    # Сравниваем относительно фактического начала непустых строк в найденном окне
+    actual_start = match_start
+    while actual_start < match_end and not f_norm[actual_start]:
+        actual_start += 1
+
+    for offset in range(n_r - n_s + 1):
+        if r_norm[offset:offset + n_s] == s_norm:
+            r_start = actual_start - offset
+            r_end = r_start + n_r
+            if 0 <= r_start and r_end <= len(f_norm):
+                if f_norm[r_start:r_end] == r_norm:
+                    return True
+    return False
+
+
+def is_candidate_already_replaced(
+    candidate_lines: List[str],
+    search_lines: List[str],
+    replace_lines: List[str]
+) -> bool:
+    """
+    Проверяет при нечетком/якорном поиске, не является ли найденный кандидат
+    уже примененным блоком replace_lines (чтобы не накатывать правку поверх).
+    """
+    c_norm = [l.strip() for l in _trim_empty_border_lines(candidate_lines) if l.strip()]
+    r_norm = [l.strip() for l in _trim_empty_border_lines(replace_lines) if l.strip()]
+    s_norm = [l.strip() for l in _trim_empty_border_lines(search_lines) if l.strip()]
+    if not c_norm or not r_norm or r_norm == s_norm:
+        return False
+    if c_norm == r_norm:
+        return True
+    c_text = "\n".join(c_norm)
+    r_text = "\n".join(r_norm)
+    s_text = "\n".join(s_norm)
+    r_ratio = get_fuzzy_ratio(c_text, r_text)
+    s_ratio = get_fuzzy_ratio(c_text, s_text)
+    return r_ratio >= 0.98 and r_ratio > s_ratio
 
 
 def rebase_indentation(
@@ -1815,7 +1964,7 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
     start_marker = "<" * 4
     mid_marker = "=" * 4
     end_marker = ">" * 4
-    file_pattern = re.compile(r"[@#*`'\"]?([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]{1,10})")
+    file_pattern = re.compile(r"[@#*`'\"]?((?:[a-zA-Z]:[\\/])?[a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]{1,10})")
 
     def extract_valid_filepath(text_line: str, check_extension: bool = True) -> Optional[str]:
         matches = file_pattern.findall(text_line)
@@ -1972,11 +2121,23 @@ def extract_create_blocks(lines: List[str]) -> List[CreateFileBlock]:
 
 def extract_powershell_commands(lines: List[str]) -> List[ScriptBlockPayload]:
     commands: List[ScriptBlockPayload] = []
+    start_patch_marker = "<" * 4
+    end_patch_marker = ">" * 4
     i = 0
     while i < len(lines):
         stripped = lines[i].strip()
 
-        if stripped.lower() in ["```powershell", "```ps1", "```ps"]:
+        # Пропускаем блоки <<<< ... >>>>, чтобы не парсить примеры кода внутри патчей
+        if stripped.startswith(start_patch_marker):
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith(end_patch_marker):
+                i += 1
+            i += 1
+            continue
+
+        lower_stripped = stripped.lower()
+        if lower_stripped in ["```powershell", "```ps1", "```ps", "```cmd", "```bat", "```batch"]:
+            shell_type = "cmd" if lower_stripped in ["```cmd", "```bat", "```batch"] else "powershell"
             start_idx = i + 1
             i += 1
             while i < len(lines) and not lines[i].strip().startswith("```"):
@@ -1984,14 +2145,28 @@ def extract_powershell_commands(lines: List[str]) -> List[ScriptBlockPayload]:
             if i < len(lines):
                 cmd = "".join(lines[start_idx:i])
                 if cmd.strip():
-                    commands.append(ScriptBlockPayload(command=cmd, start_line=start_idx + 1, end_line=i))
+                    commands.append(
+                        ScriptBlockPayload(
+                            command=cmd,
+                            start_line=start_idx + 1,
+                            end_line=i,
+                            shell_type=shell_type
+                        )
+                    )
 
         elif (
             ZeroShellTranspiler.MKDIR_COMMAND_PATTERN.match(stripped)
             or ZeroShellTranspiler.NEW_ITEM_DIR_PATTERN.match(stripped)
             or ZeroShellTranspiler.IO_DIR_CREATE_PATTERN.match(stripped)
         ):
-            commands.append(ScriptBlockPayload(command=lines[i], start_line=i + 1, end_line=i + 1))
+            commands.append(
+                ScriptBlockPayload(
+                    command=lines[i],
+                    start_line=i + 1,
+                    end_line=i + 1,
+                    shell_type="powershell"
+                )
+            )
 
         elif re.match(r"^\$(?:content|filecontent|data|text|body|code)\s*=\s*@(['\"])\s*$", stripped, re.IGNORECASE):
             quote_char = stripped[-1]
@@ -2112,6 +2287,13 @@ def _scan_directory_tree(root_dir: str, folders_to_ignore: Set[str], files_to_ig
 # ТРАНЗАКЦИОННЫЙ МЕНЕДЖЕР (С МАНИФЕСТОМ, УДАЛЕНИЕМ НОВЫХ ФАЙЛОВ И ОТКАТОМ БД)
 # ============================================================================
 
+def safe_relpath(path: Union[str, Path], start: Union[str, Path]) -> str:
+    try:
+        return os.path.relpath(str(path), start=str(start))
+    except ValueError:
+        return os.path.abspath(str(path))
+
+
 class TransactionManager:
     """Обеспечивает атомарный бэкап и полный откат (включая удаление созданных файлов и сброс кэша БД)."""
 
@@ -2125,13 +2307,19 @@ class TransactionManager:
         self._created_files: List[str] = []
         self._applied_hashes: List[str] = []
 
+    @staticmethod
+    def _to_arcname(rel_path: str) -> str:
+        if ".." in rel_path or ":" in rel_path or rel_path.startswith(("/", "\\")):
+            return "__ext__/" + hashlib.md5(rel_path.encode("utf-8")).hexdigest() + "_" + os.path.basename(rel_path)
+        return rel_path
+
     def begin_transaction(self) -> str:
         if self._active_tx_id is None:
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             self._active_tx_id = f"{ts}_{secrets.token_hex(3)}"
             self._active_zip_path = os.path.join(self.history_dir, f"tx_{self._active_tx_id}.zip")
             self._existing_files = []
-            self._created_files = []
+            self._created_files: List[str] = []
             self._applied_hashes = []
         return self._active_tx_id
 
@@ -2157,14 +2345,15 @@ class TransactionManager:
 
         for path in file_paths:
             abs_p = os.path.abspath(path)
-            rel_path = os.path.relpath(abs_p, start=self.root_dir)
+            rel_path = safe_relpath(abs_p, start=self.root_dir)
             if rel_path in self._existing_files or rel_path in self._created_files:
                 continue
 
             if os.path.exists(abs_p):
                 self._existing_files.append(rel_path)
+                arc_key = self._to_arcname(rel_path)
                 with open(abs_p, "rb") as f:
-                    existing_archive_blobs[rel_path] = f.read()
+                    existing_archive_blobs[arc_key] = f.read()
             else:
                 self._created_files.append(rel_path)
 
@@ -2218,15 +2407,17 @@ class TransactionManager:
                     manifest = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
                     # 1. Восстанавливаем измененные файлы
                     for rel_path in manifest.get("existing_files", []):
-                        if rel_path in namelist:
-                            target_abs = os.path.join(self.root_dir, rel_path)
+                        arc_key = self._to_arcname(rel_path)
+                        actual_key = arc_key if arc_key in namelist else (rel_path if rel_path in namelist else None)
+                        if actual_key is not None:
+                            target_abs = os.path.normpath(os.path.join(self.root_dir, rel_path))
                             os.makedirs(os.path.dirname(target_abs), exist_ok=True)
                             with open(target_abs, "wb") as out_f:
-                                out_f.write(zf.read(rel_path))
+                                out_f.write(zf.read(actual_key))
                     target_indexer = indexer or CodeIndexer(self.root_dir)
                     # 2. Удаляем файлы, которые были созданы в рамках транзакции, и очищаем индекс SQLite
                     for rel_path in manifest.get("created_files", []):
-                        target_abs = os.path.join(self.root_dir, rel_path)
+                        target_abs = os.path.normpath(os.path.join(self.root_dir, rel_path))
                         if os.path.exists(target_abs):
                             try:
                                 os.remove(target_abs)
@@ -3001,7 +3192,7 @@ def execute_powershell(
     root_dir: Optional[Path] = None,
     indexer: Optional[CodeIndexer] = None,
     is_auto: bool = False,
-    disable_all_except_write: bool = True
+    disable_all_except_write: Optional[bool] = None
 ) -> bool:
     target_dir = root_dir if root_dir is not None else Path(".")
     tm = TransactionManager(root_dir=str(target_dir))
@@ -3036,7 +3227,7 @@ class ReplacerAPI:
         ignore_folders: Optional[List[str]] = None,
         ignore_files: Optional[List[str]] = None,
         auto_mode: bool = True,
-        disable_all_except_write: bool = True,
+        disable_all_except_write: Optional[bool] = None,
         unsafe_direct_ps: bool = False,
         allow_multi_match_in_auto: bool = False,
         fuzzy_auto_threshold_pct: float = 90.0,
@@ -3103,14 +3294,15 @@ class ReplacerAPI:
         indexer = CodeIndexer(str(self.root_dir))
         tm = TransactionManager(str(self.root_dir))
 
-        # 1. Обработка команд PowerShell (Fast-Path запись файлов или изолированный запуск)
+        # 1. Обработка команд PowerShell и CMD
         ps_commands = extract_powershell_commands(input_lines)
         report.ps_commands_total = len(ps_commands)
 
         if ps_commands:
-            self._log(f"\n{Colors.YELLOW}Обнаружены команды PowerShell ({len(ps_commands)} шт.):{Colors.RESET}")
+            self._log(f"\n{Colors.YELLOW}Обнаружены команды PowerShell/CMD ({len(ps_commands)} шт.):{Colors.RESET}")
             for idx, payload in enumerate(ps_commands, 1):
-                self._log(f"{Colors.YELLOW}--- Команда {idx} (строки {payload.start_line}-{payload.end_line}) ---{Colors.RESET}")
+                shell_label = "CMD" if payload.shell_type.lower() == "cmd" else "PowerShell"
+                self._log(f"{Colors.YELLOW}--- Команда {idx} [{shell_label}] (строки {payload.start_line}-{payload.end_line}) ---{Colors.RESET}")
                 summary = PowerShellSecurityOrchestrator.dispatch(
                     raw_script=payload.command,
                     root_dir=self.root_dir,
@@ -3119,12 +3311,17 @@ class ReplacerAPI:
                     is_auto=self.auto_mode,
                     disable_all_except_write=self.disable_all_except_write,
                     unsafe_direct_ps=self.unsafe_direct_ps,
-                    quiet=self.quiet
+                    quiet=self.quiet,
+                    shell_type=payload.shell_type
                 )
                 report.ps_summaries.append(summary)
 
+                if summary.strategy == ExecutionStrategy.REJECTED and summary.exit_code == 0:
+                    self._log(f"{Colors.YELLOW}[ПРОПУЩЕНО] {summary.stdout}{Colors.RESET}")
+                    continue
+
                 if not summary.success:
-                    self._log(f"{Colors.RED}Прерывание работы из-за ошибки в PowerShell команде {idx}:{Colors.RESET}")
+                    self._log(f"{Colors.RED}Прерывание работы из-за ошибки в команде {idx} ({shell_label}):{Colors.RESET}")
                     if summary.error_message:
                         self._log(f"{Colors.RED}{summary.error_message}{Colors.RESET}")
                         report.errors.append(summary.error_message)
@@ -3137,8 +3334,10 @@ class ReplacerAPI:
                     return report
                 else:
                     self._log(f"{Colors.GREEN}[УСПЕХ ({summary.strategy.value})] {summary.stdout}{Colors.RESET}")
+                    if summary.stderr:
+                        self._log(f"{Colors.YELLOW}{summary.stderr}{Colors.RESET}")
                     if summary.target_path:
-                        rel_t = os.path.relpath(summary.target_path, start=str(self.root_dir))
+                        rel_t = safe_relpath(summary.target_path, start=str(self.root_dir))
                         if summary.was_new_file:
                             if rel_t not in report.created_files:
                                 report.created_files.append(rel_t)
@@ -3146,12 +3345,13 @@ class ReplacerAPI:
                             if rel_t not in report.modified_files:
                                 report.modified_files.append(rel_t)
 
-        # 1.5. Обработка декларативных блоков создания файлов (CREATE)
+        # 1.5. Предварительная валидация декларативных блоков CREATE (без записи на диск до проверки всех блоков)
         create_blocks = extract_create_blocks(input_lines)
+        pending_creates: List[Tuple[Path, str, str, bool]] = []
         if create_blocks:
             self._log(f"\n{Colors.YELLOW}Обнаружены блоки CREATE ({len(create_blocks)} шт.):{Colors.RESET}")
             for idx, cb in enumerate(create_blocks, 1):
-                self._log(f"{Colors.YELLOW}--- Создание файла {idx} (строки {cb.start_line}-{cb.end_line}): {cb.target_path_raw} ---{Colors.RESET}")
+                self._log(f"{Colors.YELLOW}--- Проверка файла {idx} (строки {cb.start_line}-{cb.end_line}): {cb.target_path_raw} ---{Colors.RESET}")
                 try:
                     resolved_target = SecurePathResolver.resolve_project_path(cb.target_path_raw, self.root_dir)
                 except PathTraversalSecurityError as e:
@@ -3163,11 +3363,28 @@ class ReplacerAPI:
                     report.duration_seconds = time.time() - start_time
                     return report
 
+                rel_t = safe_relpath(resolved_target, start=str(self.root_dir))
+                cb_hash = hashlib.md5(f"CREATE:{rel_t.replace(chr(92), '/').lower()}\n{cb.content}".encode("utf-8")).hexdigest()
                 was_new = not resolved_target.exists()
+
+                if not was_new:
+                    try:
+                        existing_text = resolved_target.read_text(encoding="utf-8-sig", errors="replace")
+                        if existing_text.rstrip("\r\n") == cb.content.rstrip("\r\n"):
+                            self._log(f"{Colors.GREEN}[ПРОПУЩЕНО (CREATE)] Файл {rel_t} уже существует и идентичен.{Colors.RESET}")
+                            indexer.mark_patch_applied(cb_hash)
+                            continue
+                        if indexer.is_patch_applied(cb_hash):
+                            self._log(
+                                f"{Colors.YELLOW}[ПРОПУЩЕНО (CREATE)] Блок создания {rel_t} уже применялся ранее, "
+                                f"а файл на диске с тех пор был изменен.{Colors.RESET}"
+                            )
+                            continue
+                    except Exception:
+                        pass
 
                 is_valid, lint_err = run_dry_linter(str(resolved_target), cb.content)
                 if not is_valid:
-                    rel_t = os.path.relpath(resolved_target, start=str(self.root_dir))
                     report.linter_errors[rel_t] = lint_err
                     err_msg = f"Проверка линтера не пройдена для {resolved_target.name}: {lint_err}"
                     self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
@@ -3177,35 +3394,36 @@ class ReplacerAPI:
                     report.duration_seconds = time.time() - start_time
                     return report
 
+                pending_creates.append((resolved_target, cb.content, cb_hash, was_new))
+
+        def commit_pending_creates() -> bool:
+            for resolved_target, content_str, cb_hash, was_new in pending_creates:
+                rel_t = safe_relpath(resolved_target, start=str(self.root_dir))
                 try:
-                    cb_hash = hashlib.md5(f"CREATE:{cb.target_path_raw}\n{cb.content}".encode("utf-8")).hexdigest()
                     tm.backup_files([str(resolved_target)], patch_hashes=[cb_hash])
                     op = TranspiledFileOperation(
                         target_path=resolved_target,
-                        content=cb.content,
+                        content=content_str,
                         encoding="utf-8",
                         mode=FileWriteMode.OVERWRITE
                     )
                     ZeroShellTranspiler.execute_operation(op)
                     indexer.mark_patch_applied(cb_hash)
-
-                    rel_t = os.path.relpath(resolved_target, start=str(self.root_dir))
                     if was_new:
                         if rel_t not in report.created_files:
                             report.created_files.append(rel_t)
                     else:
                         if rel_t not in report.modified_files:
                             report.modified_files.append(rel_t)
-
                     self._log(f"{Colors.GREEN}[УСПЕХ (CREATE)] Файл успешно записан: {rel_t}{Colors.RESET}")
                 except Exception as e:
-                    err_msg = f"Ошибка при создании файла {cb.target_path_raw}: {e}"
+                    err_msg = f"Ошибка при создании файла {rel_t}: {e}"
                     self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
                     if tm._active_tx_id is not None:
                         tm.undo_last(indexer=indexer, quiet=self.quiet)
                     report.errors.append(err_msg)
-                    report.duration_seconds = time.time() - start_time
-                    return report
+                    return False
+            return True
 
         if not blocks:
             if not ps_commands and not create_blocks:
@@ -3213,6 +3431,9 @@ class ReplacerAPI:
                 self._log(f"{Colors.RED}{msg}{Colors.RESET}")
                 report.action = "NOOP"
                 report.errors.append(msg)
+                report.duration_seconds = time.time() - start_time
+                return report
+            if not commit_pending_creates():
                 report.duration_seconds = time.time() - start_time
                 return report
             # Если были только успешные команды PowerShell или CREATE блоки:
@@ -3406,8 +3627,22 @@ class ReplacerAPI:
                     if prio_exact:
                         exact_candidates = prio_exact
 
+                # Отсеиваем совпадения, где блок replace_lines УЖЕ применен поверх search_lines
+                superseded_locs: List[Tuple[str, int, int]] = []
+                active_exact: List[Dict[str, Any]] = []
                 for ec in exact_candidates:
-                    matches_for_block.append((ec["path"], ec["start"], ec["end"]))
+                    if is_match_already_superseded(
+                        file_contents[ec["path"]], ec["start"], ec["end"], search_lines, replace_lines
+                    ):
+                        superseded_locs.append((ec["path"], ec["start"], ec["end"]))
+                    else:
+                        active_exact.append(ec)
+
+                if not active_exact and superseded_locs:
+                    already_applied_blocks[idx] = superseded_locs
+                else:
+                    for ec in active_exact:
+                        matches_for_block.append((ec["path"], ec["start"], ec["end"]))
             else:
                 for cand in candidates:
                     path = cand["path"]
@@ -3415,6 +3650,13 @@ class ReplacerAPI:
                     end = cand["end"]
 
                     candidate_lines = file_contents[path][start:end]
+                    if (
+                        is_candidate_already_replaced(candidate_lines, search_lines, replace_lines)
+                        or is_match_already_superseded(file_contents[path], start, end, search_lines, replace_lines)
+                    ):
+                        already_applied_blocks.setdefault(idx, []).append((path, start, end))
+                        continue
+
                     stats = compute_mismatch_stats(search_lines, candidate_lines)
                     cand["stats"] = stats
 
@@ -3652,6 +3894,25 @@ class ReplacerAPI:
                         matches = filtered_matches
                         block_matches[idx] = matches
 
+                # Эвристика EOF-Append: если все совпадения в одном файле, блок replace начинается с search
+                # (дописывание нового кода), и одно из совпадений находится в самом конце файла — выбираем его
+                if len(matches) > 1 and len({p for p, _, _ in matches}) == 1:
+                    s_norm = [l.strip() for l in _trim_empty_border_lines(blocks[idx]["search"])]
+                    r_norm = [l.strip() for l in _trim_empty_border_lines(blocks[idx]["replace"])]
+                    if len(r_norm) > len(s_norm) > 0 and r_norm[:len(s_norm)] == s_norm:
+                        eof_matches = [
+                            (p, s, e) for p, s, e in matches
+                            if not any(line.strip() for line in file_contents[p][e:])
+                        ]
+                        if len(eof_matches) == 1:
+                            p_eof, s_eof, e_eof = eof_matches[0]
+                            self._log(
+                                f"{Colors.GREEN}Авто-разрешение неоднозначности для блока {idx + 1}: "
+                                f"выбрано совпадение в конце файла {p_eof} (строки {s_eof + 1}-{e_eof}).{Colors.RESET}"
+                            )
+                            matches = eof_matches
+                            block_matches[idx] = matches
+
                 if len(matches) == 1:
                     p, s, e = matches[0]
                     report.block_reports.append(BlockMatchReport(
@@ -3663,7 +3924,7 @@ class ReplacerAPI:
                     ))
                     continue
 
-                locs = "\n  - ".join([f"{p} (строки {s + 1}-{e})" for p, s, e in matches])
+                locs = "\n  - ".join([f"[{m_i}] {p} (строки {s + 1}-{e})" for m_i, (p, s, e) in enumerate(matches, 1)])
                 self._log(
                     f"\n{Colors.YELLOW}Блок {idx + 1} найден {len(matches)} раз (Неоднозначность!).\n"
                     f"Где найдено:\n  - {locs}{Colors.RESET}"
@@ -3696,7 +3957,7 @@ class ReplacerAPI:
                 else:
                     try:
                         ans = input(
-                            "Применить ко всем? (y - ко всем, 1 - только к первому, s/n - пропустить) [Enter=1]: "
+                            f"Выберите действие (1..{len(matches)} - номер совпадения, y - ко всем, s/n - пропустить) [Enter=1]: "
                         ).strip().lower()
                         if not ans:
                             ans = "1"
@@ -3712,13 +3973,14 @@ class ReplacerAPI:
                             status=BlockStatus.SKIPPED_USER,
                             file_hint=file_hint
                         ))
-                    elif ans in ["1", "первый", "first"]:
-                        block_matches[idx] = [matches[0]]
+                    elif ans.isdigit() and 1 <= int(ans) <= len(matches):
+                        chosen_match = matches[int(ans) - 1]
+                        block_matches[idx] = [chosen_match]
                         report.block_reports.append(BlockMatchReport(
                             block_index=idx + 1,
                             status=BlockStatus.APPLIED,
                             file_hint=file_hint,
-                            target_files=[os.path.relpath(matches[0][0], start=str(self.root_dir))],
+                            target_files=[os.path.relpath(chosen_match[0], start=str(self.root_dir))],
                             similarity_pct=100.0
                         ))
                     else:
@@ -3863,7 +4125,14 @@ class ReplacerAPI:
 
             pending_replacements.append((path, lines, enc, newline_char))
 
+        # Записываем отложенные CREATE-блоки только после того, как все SEARCH/REPLACE прошли проверку
+        if not commit_pending_creates():
+            report.duration_seconds = time.time() - start_time
+            return report
+
         if not pending_replacements:
+            if pending_creates:
+                indexer.sync_and_read(self.ignore_folders, self.ignore_files, prompt_filenames, quiet=self.quiet)
             report.success = True
             report.transaction_id = tm._active_tx_id
             report.duration_seconds = time.time() - start_time
@@ -3967,7 +4236,7 @@ def apply_llm_file(
     file_path: Union[str, Path],
     root_dir: Union[str, Path] = ".",
     auto_mode: bool = True,
-    disable_all_except_write: bool = True,
+    disable_all_except_write: Optional[bool] = None,
     quiet: bool = False
 ) -> ReplacerExecutionReport:
     """
@@ -3987,7 +4256,7 @@ def apply_llm_text(
     llm_text: str,
     root_dir: Union[str, Path] = ".",
     auto_mode: bool = True,
-    disable_all_except_write: bool = True,
+    disable_all_except_write: Optional[bool] = None,
     quiet: bool = False
 ) -> ReplacerExecutionReport:
     """
@@ -4012,7 +4281,7 @@ def main(
     ignore_files: Optional[List[str]] = None,
     input_lines: Optional[List[str]] = None,
     auto_mode: bool = False,
-    disable_all_except_write: bool = True,
+    disable_all_except_write: Optional[bool] = None,
     root_dir: str = "."
 ) -> bool:
     api = ReplacerAPI(
@@ -4038,7 +4307,7 @@ def run_replacer(
     check_clipboard: bool = False,
     skip_clipboard_confirm: bool = False,
     auto_mode: bool = False,
-    disable_all_except_write: bool = True,
+    disable_all_except_write: Optional[bool] = None,
     root_dir: str = ".",
     copy_feedback_on_error: bool = False
 ) -> None:
@@ -4061,12 +4330,15 @@ def run_replacer(
         print(f"{Colors.CYAN}Целевая папка проекта: {os.path.abspath(root_dir)}{Colors.RESET}")
         if skip_clipboard_confirm:
             print(f"{Colors.YELLOW}Режим без подтверждения (Auto-mode) активен.{Colors.RESET}")
-        if disable_all_except_write:
+        if disable_all_except_write is True:
             print(f"{Colors.GREEN}Политика безопасности: разрешены только патчи и запись файлов (Zero-Shell).{Colors.RESET}")
+        elif disable_all_except_write is None:
+            print(f"{Colors.YELLOW}Политика команд PowerShell/CMD: индивидуальный запрос (y/n) для каждой команды.{Colors.RESET}")
 
         last_clip_hash = None
+        processed_clip_hashes: Set[str] = set()
         init_text = get_clipboard_content()
-        if init_text and not has_actionable_markers(init_text):
+        if init_text:
             last_clip_hash = hashlib.md5(init_text.encode("utf-8", errors="ignore")).hexdigest()
 
         api = ReplacerAPI(
@@ -4087,6 +4359,15 @@ def run_replacer(
                         if clip_hash != last_clip_hash:
                             last_clip_hash = clip_hash
                             if has_actionable_markers(clip_text):
+                                if ",!!!" in clip_text:
+                                    processed_clip_hashes.clear()
+                                elif clip_hash in processed_clip_hashes:
+                                    print(
+                                        f"\n{Colors.YELLOW}[ПРОПУСК] Этот набор правок из буфера обмена "
+                                        f"уже был успешно применен в текущей сессии.{Colors.RESET}"
+                                    )
+                                    time.sleep(1)
+                                    continue
                                 lines = [l + "\n" for l in clip_text.splitlines()]
                                 if not skip_clipboard_confirm:
                                     print(f"\n{Colors.YELLOW}Обнаружены новые правки в буфере обмена.{Colors.RESET}")
@@ -4103,6 +4384,10 @@ def run_replacer(
 
                                 print(f"\n{Colors.GREEN}Обработка правок из буфера обмена...{Colors.RESET}")
                                 report = api.apply_lines(lines)
+                                if report.success and report.action == "APPLY":
+                                    processed_clip_hashes.add(clip_hash)
+                                elif report.success and report.action == "UNDO":
+                                    processed_clip_hashes.clear()
                                 if not report.success and copy_feedback_on_error:
                                     feedback_str = report.to_llm_feedback()
                                     if set_clipboard_content(feedback_str):
@@ -4191,16 +4476,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Откатить последнюю транзакцию (восстановить измененные файлы и удалить созданные)."
     )
     parser.add_argument(
+        "--only-write",
+        dest="only_write",
+        action="store_true",
+        help="Запретить любые команды PowerShell/CMD кроме записи файлов (disable_all_except_write=True)."
+    )
+    parser.add_argument(
         "--allow-ps",
         dest="allow_ps",
         action="store_true",
-        help="Разрешить выполнение императивных скриптов PowerShell в изолированной песочнице (по умолчанию разрешена только запись файлов)."
+        help="Разрешить выполнение команд PowerShell/CMD без индивидуального запроса в авто-режиме (disable_all_except_write=False)."
     )
     parser.add_argument(
         "--unsafe-direct-ps",
         dest="unsafe_direct_ps",
         action="store_true",
-        help="Разрешить прямой запуск PowerShell без Job Object песочницы (НЕ РЕКОМЕНДУЕТСЯ)."
+        help="Разрешить прямой запуск PowerShell/CMD (disable_all_except_write=False)."
     )
     parser.add_argument(
         "--allow-multi-match",
@@ -4233,7 +4524,12 @@ def cli_entry_point() -> None:
     args = parser.parse_args()
 
     target_file = args.file_opt or args.input_file
-    disable_all_except_write = not (args.allow_ps or args.unsafe_direct_ps)
+    if args.allow_ps or args.unsafe_direct_ps:
+        disable_all_except_write: Optional[bool] = False
+    elif getattr(args, "only_write", False):
+        disable_all_except_write = True
+    else:
+        disable_all_except_write = None
     quiet_mode = bool(args.json_output)
 
     # Формируем динамический список исключений: входной файл промпта и файл фидбека

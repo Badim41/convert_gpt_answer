@@ -147,7 +147,7 @@ from network_tools import NetworkToolsAPI
 import secret
 
 network_api = NetworkToolsAPI(secret.newtork_tools_api_key)
-project_path = None # r"C:\Users\as280\PycharmProjects\telegram_bot\extra\blesk_fox_project\blesk_fox_site"
+project_path = None #  # r"C:\...\project_path"
 ignore_folders = ["node_modules", "__pycache__", ".agents", "htmlcov", "raw", "tmp", "logs", ".deepsearch", "manifests", "data", "docs", ".venv", "venv"]
 ignore_file_list = ["secret.py", "get_structure.py", "replacer.py", ".env"]
 

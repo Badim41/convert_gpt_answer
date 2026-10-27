@@ -2008,7 +2008,9 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
     start_line_re = re.compile(r"^[ \t]{0,3}<" + r"{4,12}(?:[ \t]+.*)?$")
     end_line_re = re.compile(r"^[ \t]{0,3}>" + r"{4,12}(?:[ \t]+.*)?$")
 
-    for line in lines:
+    current_start_line = 1
+
+    for line_idx, line in enumerate(lines, 1):
         line_no_nl = line.rstrip("\r\n")
         stripped = line_no_nl.strip()
 
@@ -2027,6 +2029,7 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
                 current_file_hint = inline_hint or extract_file_hint_from_recent_lines(recent_lines)
                 closing_marker = end_marker
                 state = 1
+                current_start_line = line_idx
                 current_search = []
                 current_replace = []
             elif is_start_inverted:
@@ -2035,6 +2038,7 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
                 current_file_hint = inline_hint or extract_file_hint_from_recent_lines(recent_lines)
                 closing_marker = start_marker
                 state = 1
+                current_start_line = line_idx
                 current_search = []
                 current_replace = []
             else:
@@ -2051,7 +2055,9 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
                 blocks.append({
                     "search": trim_lines_search(current_search),
                     "replace": current_replace,
-                    "file_hint": current_file_hint
+                    "file_hint": current_file_hint,
+                    "start_line": current_start_line,
+                    "end_line": line_idx
                 })
                 state = 0
                 current_file_hint = None
@@ -2068,7 +2074,9 @@ def parse_patch_blocks(lines: List[str]) -> Union[str, List[Dict[str, Any]]]:
         blocks.append({
             "search": trim_lines_search(current_search),
             "replace": current_replace,
-            "file_hint": current_file_hint
+            "file_hint": current_file_hint,
+            "start_line": current_start_line,
+            "end_line": len(lines)
         })
 
     return blocks
@@ -3294,161 +3302,56 @@ class ReplacerAPI:
         indexer = CodeIndexer(str(self.root_dir))
         tm = TransactionManager(str(self.root_dir))
 
-        # 1. Обработка команд PowerShell и CMD
         ps_commands = extract_powershell_commands(input_lines)
         report.ps_commands_total = len(ps_commands)
-
-        if ps_commands:
-            self._log(f"\n{Colors.YELLOW}Обнаружены команды PowerShell/CMD ({len(ps_commands)} шт.):{Colors.RESET}")
-            for idx, payload in enumerate(ps_commands, 1):
-                shell_label = "CMD" if payload.shell_type.lower() == "cmd" else "PowerShell"
-                self._log(f"{Colors.YELLOW}--- Команда {idx} [{shell_label}] (строки {payload.start_line}-{payload.end_line}) ---{Colors.RESET}")
-                summary = PowerShellSecurityOrchestrator.dispatch(
-                    raw_script=payload.command,
-                    root_dir=self.root_dir,
-                    tm=tm,
-                    indexer=indexer,
-                    is_auto=self.auto_mode,
-                    disable_all_except_write=self.disable_all_except_write,
-                    unsafe_direct_ps=self.unsafe_direct_ps,
-                    quiet=self.quiet,
-                    shell_type=payload.shell_type
-                )
-                report.ps_summaries.append(summary)
-
-                if summary.strategy == ExecutionStrategy.REJECTED and summary.exit_code == 0:
-                    self._log(f"{Colors.YELLOW}[ПРОПУЩЕНО] {summary.stdout}{Colors.RESET}")
-                    continue
-
-                if not summary.success:
-                    self._log(f"{Colors.RED}Прерывание работы из-за ошибки в команде {idx} ({shell_label}):{Colors.RESET}")
-                    if summary.error_message:
-                        self._log(f"{Colors.RED}{summary.error_message}{Colors.RESET}")
-                        report.errors.append(summary.error_message)
-                    if summary.stderr and summary.stderr != summary.error_message:
-                        self._log(f"{Colors.YELLOW}{summary.stderr}{Colors.RESET}")
-                    # Если в рамках этой транзакции уже были изменены файлы — откатываем
-                    if tm._active_tx_id is not None:
-                        tm.undo_last(indexer=indexer, quiet=self.quiet)
-                    report.duration_seconds = time.time() - start_time
-                    return report
-                else:
-                    self._log(f"{Colors.GREEN}[УСПЕХ ({summary.strategy.value})] {summary.stdout}{Colors.RESET}")
-                    if summary.stderr:
-                        self._log(f"{Colors.YELLOW}{summary.stderr}{Colors.RESET}")
-                    if summary.target_path:
-                        rel_t = safe_relpath(summary.target_path, start=str(self.root_dir))
-                        if summary.was_new_file:
-                            if rel_t not in report.created_files:
-                                report.created_files.append(rel_t)
-                        else:
-                            if rel_t not in report.modified_files:
-                                report.modified_files.append(rel_t)
-
-        # 1.5. Предварительная валидация декларативных блоков CREATE (без записи на диск до проверки всех блоков)
         create_blocks = extract_create_blocks(input_lines)
-        pending_creates: List[Tuple[Path, str, str, bool]] = []
-        if create_blocks:
-            self._log(f"\n{Colors.YELLOW}Обнаружены блоки CREATE ({len(create_blocks)} шт.):{Colors.RESET}")
-            for idx, cb in enumerate(create_blocks, 1):
-                self._log(f"{Colors.YELLOW}--- Проверка файла {idx} (строки {cb.start_line}-{cb.end_line}): {cb.target_path_raw} ---{Colors.RESET}")
-                try:
-                    resolved_target = SecurePathResolver.resolve_project_path(cb.target_path_raw, self.root_dir)
-                except PathTraversalSecurityError as e:
-                    err_msg = f"Ошибка безопасности при создании файла {cb.target_path_raw}: {e}"
-                    self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
-                    if tm._active_tx_id is not None:
-                        tm.undo_last(indexer=indexer, quiet=self.quiet)
-                    report.errors.append(err_msg)
-                    report.duration_seconds = time.time() - start_time
-                    return report
 
-                rel_t = safe_relpath(resolved_target, start=str(self.root_dir))
-                cb_hash = hashlib.md5(f"CREATE:{rel_t.replace(chr(92), '/').lower()}\n{cb.content}".encode("utf-8")).hexdigest()
-                was_new = not resolved_target.exists()
-
-                if not was_new:
-                    try:
-                        existing_text = resolved_target.read_text(encoding="utf-8-sig", errors="replace")
-                        if existing_text.rstrip("\r\n") == cb.content.rstrip("\r\n"):
-                            self._log(f"{Colors.GREEN}[ПРОПУЩЕНО (CREATE)] Файл {rel_t} уже существует и идентичен.{Colors.RESET}")
-                            indexer.mark_patch_applied(cb_hash)
-                            continue
-                        if indexer.is_patch_applied(cb_hash):
-                            self._log(
-                                f"{Colors.YELLOW}[ПРОПУЩЕНО (CREATE)] Блок создания {rel_t} уже применялся ранее, "
-                                f"а файл на диске с тех пор был изменен.{Colors.RESET}"
-                            )
-                            continue
-                    except Exception:
-                        pass
-
-                is_valid, lint_err = run_dry_linter(str(resolved_target), cb.content)
-                if not is_valid:
-                    report.linter_errors[rel_t] = lint_err
-                    err_msg = f"Проверка линтера не пройдена для {resolved_target.name}: {lint_err}"
-                    self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
-                    if tm._active_tx_id is not None:
-                        tm.undo_last(indexer=indexer, quiet=self.quiet)
-                    report.errors.append(err_msg)
-                    report.duration_seconds = time.time() - start_time
-                    return report
-
-                pending_creates.append((resolved_target, cb.content, cb_hash, was_new))
-
-        def commit_pending_creates() -> bool:
-            for resolved_target, content_str, cb_hash, was_new in pending_creates:
-                rel_t = safe_relpath(resolved_target, start=str(self.root_dir))
-                try:
-                    tm.backup_files([str(resolved_target)], patch_hashes=[cb_hash])
-                    op = TranspiledFileOperation(
-                        target_path=resolved_target,
-                        content=content_str,
-                        encoding="utf-8",
-                        mode=FileWriteMode.OVERWRITE
-                    )
-                    ZeroShellTranspiler.execute_operation(op)
-                    indexer.mark_patch_applied(cb_hash)
-                    if was_new:
-                        if rel_t not in report.created_files:
-                            report.created_files.append(rel_t)
-                    else:
-                        if rel_t not in report.modified_files:
-                            report.modified_files.append(rel_t)
-                    self._log(f"{Colors.GREEN}[УСПЕХ (CREATE)] Файл успешно записан: {rel_t}{Colors.RESET}")
-                except Exception as e:
-                    err_msg = f"Ошибка при создании файла {rel_t}: {e}"
-                    self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
-                    if tm._active_tx_id is not None:
-                        tm.undo_last(indexer=indexer, quiet=self.quiet)
-                    report.errors.append(err_msg)
-                    return False
-            return True
-
-        if not blocks:
-            if not ps_commands and not create_blocks:
-                msg = f"Не найдено ни одного блока с маркерами {'<' * 4} {'=' * 4} {'>' * 4}, блоков CREATE или команд PowerShell!"
-                self._log(f"{Colors.RED}{msg}{Colors.RESET}")
-                report.action = "NOOP"
-                report.errors.append(msg)
-                report.duration_seconds = time.time() - start_time
-                return report
-            if not commit_pending_creates():
-                report.duration_seconds = time.time() - start_time
-                return report
-            # Если были только успешные команды PowerShell или CREATE блоки:
-            # синхронизируем индекс SQLite, чтобы новые файлы сразу попали в базу и FTS
-            indexer.sync_and_read(self.ignore_folders, self.ignore_files, prompt_filenames, quiet=self.quiet)
-            report.success = True
-            report.transaction_id = tm._active_tx_id
+        if not blocks and not ps_commands and not create_blocks:
+            msg = f"Не найдено ни одного блока с маркерами {'<' * 4} {'=' * 4} {'>' * 4}, блоков CREATE или команд PowerShell/CMD!"
+            self._log(f"{Colors.RED}{msg}{Colors.RESET}")
+            report.action = "NOOP"
+            report.errors.append(msg)
             report.duration_seconds = time.time() - start_time
             return report
 
-        # 2. Обработка блоков Search / Replace
-        self._log(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
-        file_contents, file_encodings, non_utf8_files, code_file_contents, other_file_contents = indexer.sync_and_read(
-            self.ignore_folders, self.ignore_files, prompt_filenames, quiet=self.quiet
-        )
+        # 1. Предварительная валидация путей и синтаксиса всех блоков CREATE (до выполнения любых операций)
+        validated_creates: List[Dict[str, Any]] = []
+        for cb in create_blocks:
+            try:
+                resolved_target = SecurePathResolver.resolve_project_path(cb.target_path_raw, self.root_dir)
+            except PathTraversalSecurityError as e:
+                err_msg = f"Ошибка безопасности при создании файла {cb.target_path_raw}: {e}"
+                self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
+                report.errors.append(err_msg)
+                report.duration_seconds = time.time() - start_time
+                return report
+
+            rel_t = safe_relpath(resolved_target, start=str(self.root_dir))
+            cb_hash = hashlib.md5(f"CREATE:{rel_t.replace(chr(92), '/').lower()}\n{cb.content}".encode("utf-8")).hexdigest()
+            is_valid, lint_err = run_dry_linter(str(resolved_target), cb.content)
+            if not is_valid:
+                report.linter_errors[rel_t] = lint_err
+                err_msg = f"Проверка линтера не пройдена для {resolved_target.name}: {lint_err}"
+                self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
+                report.errors.append(err_msg)
+                report.duration_seconds = time.time() - start_time
+                return report
+
+            validated_creates.append({
+                "cb": cb,
+                "resolved_target": resolved_target,
+                "rel_t": rel_t,
+                "cb_hash": cb_hash
+            })
+
+        # 2. Предварительный поиск и валидация блоков Search / Replace (если они есть)
+        if blocks:
+            self._log(f"\nРаспознано блоков правок: {len(blocks)}. Идет сканирование файлов...")
+            file_contents, file_encodings, non_utf8_files, code_file_contents, other_file_contents = indexer.sync_and_read(
+                self.ignore_folders, self.ignore_files, prompt_filenames, quiet=self.quiet
+            )
+        else:
+            file_contents, file_encodings, non_utf8_files, code_file_contents, other_file_contents = {}, {}, [], {}, {}
 
         block_matches: List[List[Tuple[str, int, int]]] = []
         already_applied_blocks: Dict[int, List[Tuple[str, int, int]]] = {}
@@ -4021,204 +3924,329 @@ class ReplacerAPI:
             report.duration_seconds = time.time() - start_time
             return report
 
-        # 4. Сборка модификаций с авто-коррекцией отступов (rebase_indentation)
-        file_modifications: Dict[str, List[Dict[str, Any]]] = {f: [] for f in file_contents}
-        applied_patch_hashes: List[str] = []
+        # 4. Сборка и предварительная проверка модификаций Search/Replace (если они есть)
+        file_modifications: Dict[str, List[Dict[str, Any]]] = {}
+        mods_by_block: Dict[int, List[Dict[str, Any]]] = {idx: [] for idx in range(len(blocks))}
+        resolved_file_enc: Dict[str, Tuple[str, str]] = {}
 
-        for idx, matches in enumerate(block_matches):
-            if not matches:
-                continue
-            p_hash_gen = indexer.get_patch_hash(blocks[idx]["search"], blocks[idx]["replace"])
-            if p_hash_gen not in applied_patch_hashes:
-                applied_patch_hashes.append(p_hash_gen)
+        if blocks:
+            file_modifications = {f: [] for f in file_contents}
+            for idx, matches in enumerate(block_matches):
+                if not matches:
+                    continue
+                p_hash_gen = indexer.get_patch_hash(blocks[idx]["search"], blocks[idx]["replace"])
 
-            for match in matches:
-                path, start_idx, end_idx = match
-                rel_p = os.path.relpath(path, start=str(self.root_dir))
-                p_hash_file = indexer.get_patch_hash(blocks[idx]["search"], blocks[idx]["replace"], file_path=rel_p)
-                if p_hash_file not in applied_patch_hashes:
-                    applied_patch_hashes.append(p_hash_file)
+                for match in matches:
+                    path, start_idx, end_idx = match
+                    rel_p = safe_relpath(path, start=str(self.root_dir))
+                    p_hash_file = indexer.get_patch_hash(blocks[idx]["search"], blocks[idx]["replace"], file_path=rel_p)
 
-                matched_slice = file_contents[path][start_idx:end_idx]
-                rebased_replace = rebase_indentation(
-                    matched_file_lines=matched_slice,
-                    search_lines=blocks[idx]["search"],
-                    replace_lines=blocks[idx]["replace"]
-                )
-                file_modifications[path].append({
-                    "start": start_idx,
-                    "end": end_idx,
-                    "replace": rebased_replace,
-                    "search": blocks[idx]["search"],
-                    "block_idx": idx + 1
-                })
-            report.blocks_applied += 1
+                    matched_slice = file_contents[path][start_idx:end_idx]
+                    rebased_replace = rebase_indentation(
+                        matched_file_lines=matched_slice,
+                        search_lines=blocks[idx]["search"],
+                        replace_lines=blocks[idx]["replace"]
+                    )
+                    mod_obj = {
+                        "start": start_idx,
+                        "end": end_idx,
+                        "replace": rebased_replace,
+                        "search": blocks[idx]["search"],
+                        "block_idx": idx + 1
+                    }
+                    file_modifications[path].append(mod_obj)
+                    mods_by_block[idx].append({
+                        "path": path,
+                        "mod": mod_obj,
+                        "hashes": [p_hash_gen, p_hash_file]
+                    })
+                report.blocks_applied += 1
 
-        # Проверка на наложение (overlap) блоков в одном файле
-        overlap_errors: List[str] = []
-        for path, mods in file_modifications.items():
-            if len(mods) > 1:
-                mods_sorted = sorted(mods, key=lambda x: (x["start"], x["end"]))
-                for k in range(len(mods_sorted) - 1):
-                    m1 = mods_sorted[k]
-                    m2 = mods_sorted[k + 1]
-                    if m1["end"] > m2["start"]:
-                        rel_p = os.path.relpath(path, start=str(self.root_dir))
-                        err_msg = (
-                            f"Конфликт наложения блоков в файле '{rel_p}': блок #{m1['block_idx']} "
-                            f"(строки {m1['start'] + 1}-{m1['end']}) перекрывается с блоком #{m2['block_idx']} "
-                            f"(строки {m2['start'] + 1}-{m2['end']}). Объедините эти изменения в один блок замены."
-                        )
-                        overlap_errors.append(err_msg)
-                        for br in report.block_reports:
-                            if br.block_index in (m1["block_idx"], m2["block_idx"]):
-                                br.status = BlockStatus.FAILED_AMBIGUOUS
-                                br.error_message = err_msg
+            # Проверка на наложение (overlap) блоков в одном файле
+            overlap_errors: List[str] = []
+            for path, mods in file_modifications.items():
+                if len(mods) > 1:
+                    mods_sorted = sorted(mods, key=lambda x: (x["start"], x["end"]))
+                    for k in range(len(mods_sorted) - 1):
+                        m1 = mods_sorted[k]
+                        m2 = mods_sorted[k + 1]
+                        if m1["end"] > m2["start"]:
+                            rel_p = safe_relpath(path, start=str(self.root_dir))
+                            err_msg = (
+                                f"Конфликт наложения блоков в файле '{rel_p}': блок #{m1['block_idx']} "
+                                f"(строки {m1['start'] + 1}-{m1['end']}) перекрывается с блоком #{m2['block_idx']} "
+                                f"(строки {m2['start'] + 1}-{m2['end']}). Объедините эти изменения в один блок замены."
+                            )
+                            overlap_errors.append(err_msg)
+                            for br in report.block_reports:
+                                if br.block_index in (m1["block_idx"], m2["block_idx"]):
+                                    br.status = BlockStatus.FAILED_AMBIGUOUS
+                                    br.error_message = err_msg
 
-        if overlap_errors:
-            self._log(f"\n{Colors.RED}{'=' * 60}")
-            self._log("КРИТИЧЕСКАЯ ОШИБКА: ОБНАРУЖЕНО ПЕРЕСЕЧЕНИЕ БЛОКОВ ЗАМЕНЫ.")
-            self._log(f"{'=' * 60}{Colors.RESET}")
-            for err in overlap_errors:
-                self._log(f"{Colors.RED}{err}{Colors.RESET}")
-                self._log(f"{Colors.YELLOW}{'-' * 60}{Colors.RESET}")
+            if overlap_errors:
+                self._log(f"\n{Colors.RED}{'=' * 60}")
+                self._log("КРИТИЧЕСКАЯ ОШИБКА: ОБНАРУЖЕНО ПЕРЕСЕЧЕНИЕ БЛОКОВ ЗАМЕНЫ.")
+                self._log(f"{'=' * 60}{Colors.RESET}")
+                for err in overlap_errors:
+                    self._log(f"{Colors.RED}{err}{Colors.RESET}")
+                    self._log(f"{Colors.YELLOW}{'-' * 60}{Colors.RESET}")
 
-            if tm._active_tx_id is not None:
-                tm.undo_last(indexer=indexer, quiet=self.quiet)
+                report.errors.extend(overlap_errors)
+                report.duration_seconds = time.time() - start_time
+                return report
 
-            report.errors.extend(overlap_errors)
-            report.duration_seconds = time.time() - start_time
-            return report
-
-        pending_replacements: List[Tuple[str, List[str], str, str]] = []
-
-        for path, mods in file_modifications.items():
-            if not mods:
-                continue
-
-            mods.sort(key=lambda x: x["start"], reverse=True)
-            lines = file_contents[path][:]
-
-            for mod in mods:
-                start = mod["start"]
-                end = mod["end"]
-                replace_lines = mod["replace"]
-                lines = lines[:start] + replace_lines + lines[end:]
-
-            enc_info = file_encodings.get(path, ("utf-8", "\n"))
-            enc, newline_char = enc_info if isinstance(enc_info, tuple) else (enc_info, "\n")
-
-            if "utf-16" in enc.lower():
-                self._log(f"\n{Colors.YELLOW}Файл {path} обнаружен в кодировке {enc}.{Colors.RESET}")
-                ans = "y" if self.auto_mode else "n"
-                if not self.auto_mode:
-                    try:
-                        ans = input("Перезаписать в UTF-8? [y/n] (Enter=y): ").strip().lower()
-                        if not ans:
-                            ans = "y"
-                    except EOFError:
-                        ans = "y"
-                if ans in ["y", "yes", "да", "1"]:
-                    enc = "utf-8"
-                else:
+            # Предварительная проверка синтаксиса (Dry Linter) итогового состояния всех изменяемых файлов
+            for path, mods in file_modifications.items():
+                if not mods:
                     continue
 
-            pending_replacements.append((path, lines, enc, newline_char))
+                mods_desc = sorted(mods, key=lambda x: x["start"], reverse=True)
+                lines = file_contents[path][:]
+                for mod in mods_desc:
+                    lines = lines[:mod["start"]] + mod["replace"] + lines[mod["end"]:]
 
-        # Записываем отложенные CREATE-блоки только после того, как все SEARCH/REPLACE прошли проверку
-        if not commit_pending_creates():
-            report.duration_seconds = time.time() - start_time
-            return report
+                enc_info = file_encodings.get(path, ("utf-8", "\n"))
+                enc, newline_char = enc_info if isinstance(enc_info, tuple) else (enc_info, "\n")
 
-        if not pending_replacements:
-            if pending_creates:
-                indexer.sync_and_read(self.ignore_folders, self.ignore_files, prompt_filenames, quiet=self.quiet)
-            report.success = True
-            report.transaction_id = tm._active_tx_id
-            report.duration_seconds = time.time() - start_time
-            return report
+                if "utf-16" in enc.lower():
+                    self._log(f"\n{Colors.YELLOW}Файл {path} обнаружен в кодировке {enc}.{Colors.RESET}")
+                    ans = "y" if self.auto_mode else "n"
+                    if not self.auto_mode:
+                        try:
+                            ans = input("Перезаписать в UTF-8? [y/n] (Enter=y): ").strip().lower()
+                            if not ans:
+                                ans = "y"
+                        except EOFError:
+                            ans = "y"
+                    if ans in ["y", "yes", "да", "1"]:
+                        enc = "utf-8"
 
-        # 5. Создание бэкапа транзакции
-        try:
-            changed_paths = [d[0] for d in pending_replacements]
-            tx_id = tm.backup_files(changed_paths, patch_hashes=applied_patch_hashes)
-            report.transaction_id = tx_id
-            self._log(f"{Colors.GREEN}Создана резервная копия транзакции: tx_{tx_id}{Colors.RESET}")
-        except Exception as e:
-            err_str = f"Ошибка создания резервной копии: {e}"
-            self._log(f"{Colors.RED}{err_str}{Colors.RESET}")
-            report.errors.append(err_str)
-            report.duration_seconds = time.time() - start_time
-            return report
+                resolved_file_enc[path] = (enc, newline_char)
+                content = newline_char.join(lines) + newline_char
+                is_valid, err_msg = run_dry_linter(path, content)
+                if not is_valid:
+                    rel_p = safe_relpath(path, start=str(self.root_dir))
+                    report.linter_errors[rel_p] = err_msg
+                    self._log(f"\n{Colors.RED}Синтаксическая ошибка в файле {path}:{Colors.RESET}")
+                    self._log(f"{Colors.YELLOW}{err_msg}{Colors.RESET}")
 
-        # 6. Строгая проверка синтаксиса (Dry Linter) ДО записи на диск
-        for path, lines, enc, newline_char in pending_replacements:
-            content = newline_char.join(lines) + newline_char
-            is_valid, err_msg = run_dry_linter(path, content)
-            if not is_valid:
-                rel_p = os.path.relpath(path, start=str(self.root_dir))
-                report.linter_errors[rel_p] = err_msg
-                self._log(f"\n{Colors.RED}Синтаксическая ошибка в файле {path}:{Colors.RESET}")
-                self._log(f"{Colors.YELLOW}{err_msg}{Colors.RESET}")
-
-                if self.auto_mode:
-                    self._log(f"{Colors.RED}Auto-mode: Запись заблокирована из-за синтаксической ошибки. Выполняется откат...{Colors.RESET}")
-                    tm.undo_last(indexer=indexer, quiet=self.quiet)
-                    report.errors.append(f"Синтаксическая ошибка в {rel_p}: {err_msg}")
-                    report.duration_seconds = time.time() - start_time
-                    return report
-                else:
-                    try:
-                        ans = input("Игнорировать синтаксическую ошибку и все равно сохранить? [y/N]: ").strip().lower()
-                    except EOFError:
-                        ans = "n"
-                    if ans not in ["y", "yes", "да", "1"]:
-                        self._log(f"{Colors.RED}Запись отменена пользователем. Выполняется откат...{Colors.RESET}")
-                        tm.undo_last(indexer=indexer, quiet=self.quiet)
+                    if self.auto_mode:
+                        self._log(f"{Colors.RED}Auto-mode: Запись заблокирована из-за синтаксической ошибки.{Colors.RESET}")
                         report.errors.append(f"Синтаксическая ошибка в {rel_p}: {err_msg}")
                         report.duration_seconds = time.time() - start_time
                         return report
+                    else:
+                        try:
+                            ans = input("Игнорировать синтаксическую ошибку и все равно сохранить? [y/N]: ").strip().lower()
+                        except EOFError:
+                            ans = "n"
+                        if ans not in ["y", "yes", "да", "1"]:
+                            self._log(f"{Colors.RED}Запись отменена пользователем.{Colors.RESET}")
+                            report.errors.append(f"Синтаксическая ошибка в {rel_p}: {err_msg}")
+                            report.duration_seconds = time.time() - start_time
+                            return report
 
-        # 7. Атомарная запись всех файлов
-        def safe_atomic_write(file_data: Tuple[str, List[str], str, str]) -> str:
-            path, lines, enc, newline_char = file_data
-            content = newline_char.join(lines) + newline_char
-            tmp_path = f"{path}.{secrets.token_hex(4)}.tmp_write"
-            with open(tmp_path, "w", encoding=enc, newline="") as f:
-                f.write(content)
-            os.replace(tmp_path, path)
-            return path
+        # 5. Единая очередь выполнения всех операций в строгом порядке следования строк (1..N)
+        timeline: List[Dict[str, Any]] = []
+        for vc in validated_creates:
+            cb = vc["cb"]
+            timeline.append({
+                "type": "CREATE",
+                "start_line": cb.start_line,
+                "end_line": cb.end_line,
+                "data": vc
+            })
+        for idx, b in enumerate(blocks):
+            timeline.append({
+                "type": "PATCH",
+                "start_line": b.get("start_line", 0),
+                "end_line": b.get("end_line", 0),
+                "block_idx": idx
+            })
+        for payload in ps_commands:
+            timeline.append({
+                "type": "SHELL",
+                "start_line": payload.start_line,
+                "end_line": payload.end_line,
+                "payload": payload
+            })
 
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=32) as executor:
-                futures = [executor.submit(safe_atomic_write, d) for d in pending_replacements]
-                for future in concurrent.futures.as_completed(futures):
-                    path = future.result()
-                    rel_p = os.path.relpath(path, start=str(self.root_dir))
-                    if rel_p not in report.modified_files:
-                        report.modified_files.append(rel_p)
-                    self._log(f"Обновлен файл: {Colors.YELLOW}{path}{Colors.RESET}")
+        timeline.sort(key=lambda item: (item["start_line"], item["end_line"]))
+        total_ops = len(timeline)
+        active_mods_per_file: Dict[str, List[Dict[str, Any]]] = {f: [] for f in file_modifications}
 
-            for p_hash in applied_patch_hashes:
-                indexer.mark_patch_applied(p_hash)
-        except Exception as e:
-            err_str = f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПИСИ: {e}"
-            self._log(f"{Colors.RED}{err_str}{Colors.RESET}")
-            self._log(f"{Colors.YELLOW}Транзакция прервана! Выполняется откат изменений...{Colors.RESET}")
-            tm.undo_last(indexer=indexer, quiet=self.quiet)
-            report.errors.append(err_str)
-            report.duration_seconds = time.time() - start_time
-            return report
+        self._log(f"\n{Colors.CYAN}Выполнение операций по порядку (всего: {total_ops}):{Colors.RESET}")
 
-        # Актуализируем базу SQLite для всех измененных файлов
+        for op_idx, item in enumerate(timeline, 1):
+            op_type = item["type"]
+
+            if op_type == "CREATE":
+                vc = item["data"]
+                cb: CreateFileBlock = vc["cb"]
+                resolved_target: Path = vc["resolved_target"]
+                rel_t: str = vc["rel_t"]
+                cb_hash: str = vc["cb_hash"]
+
+                self._log(
+                    f"\n{Colors.YELLOW}--- Действие {op_idx}/{total_ops} [CREATE] "
+                    f"(строки {cb.start_line}-{cb.end_line}): {cb.target_path_raw} ---{Colors.RESET}"
+                )
+                was_new = not resolved_target.exists()
+                if not was_new:
+                    try:
+                        existing_text = resolved_target.read_text(encoding="utf-8-sig", errors="replace")
+                        if existing_text.rstrip("\r\n") == cb.content.rstrip("\r\n"):
+                            self._log(f"{Colors.GREEN}[ПРОПУЩЕНО (CREATE)] Файл {rel_t} уже существует и идентичен.{Colors.RESET}")
+                            indexer.mark_patch_applied(cb_hash)
+                            continue
+                        if indexer.is_patch_applied(cb_hash):
+                            self._log(
+                                f"{Colors.YELLOW}[ПРОПУЩЕНО (CREATE)] Блок создания {rel_t} уже применялся ранее, "
+                                f"а файл на диске с тех пор был изменен.{Colors.RESET}"
+                            )
+                            continue
+                    except Exception:
+                        pass
+
+                try:
+                    tm.backup_files([str(resolved_target)], patch_hashes=[cb_hash])
+                    op = TranspiledFileOperation(
+                        target_path=resolved_target,
+                        content=cb.content,
+                        encoding="utf-8",
+                        mode=FileWriteMode.OVERWRITE
+                    )
+                    ZeroShellTranspiler.execute_operation(op)
+                    indexer.mark_patch_applied(cb_hash)
+                    if was_new:
+                        if rel_t not in report.created_files:
+                            report.created_files.append(rel_t)
+                    else:
+                        if rel_t not in report.modified_files:
+                            report.modified_files.append(rel_t)
+                    self._log(f"{Colors.GREEN}[УСПЕХ (CREATE)] Файл успешно записан: {rel_t}{Colors.RESET}")
+                except Exception as e:
+                    err_msg = f"Ошибка при создании файла {rel_t}: {e}"
+                    self._log(f"{Colors.RED}{err_msg}{Colors.RESET}")
+                    if tm._active_tx_id is not None:
+                        tm.undo_last(indexer=indexer, quiet=self.quiet)
+                    report.errors.append(err_msg)
+                    report.duration_seconds = time.time() - start_time
+                    return report
+
+            elif op_type == "PATCH":
+                b_idx: int = item["block_idx"]
+                b = blocks[b_idx]
+                hint_str = f": {b['file_hint']}" if b.get("file_hint") else ""
+                self._log(
+                    f"\n{Colors.YELLOW}--- Действие {op_idx}/{total_ops} [PATCH] "
+                    f"(строки {item['start_line']}-{item['end_line']}){hint_str} ---{Colors.RESET}"
+                )
+
+                if b_idx in cached_blocks:
+                    self._log(f"{Colors.GREEN}[ПРОПУЩЕНО (PATCH)] Блок уже был применен ранее (кэш БД).{Colors.RESET}")
+                    continue
+                if b_idx in user_skipped_blocks:
+                    self._log(f"{Colors.YELLOW}[ПРОПУЩЕНО (PATCH)] Блок пропущен пользователем.{Colors.RESET}")
+                    continue
+                if not mods_by_block.get(b_idx):
+                    self._log(f"{Colors.GREEN}[ПРОПУЩЕНО (PATCH)] Изменения уже присутствуют в коде.{Colors.RESET}")
+                    continue
+
+                try:
+                    for entry in mods_by_block[b_idx]:
+                        path = entry["path"]
+                        mod_obj = entry["mod"]
+                        hashes = entry["hashes"]
+                        rel_p = safe_relpath(path, start=str(self.root_dir))
+
+                        tm.backup_files([path], patch_hashes=hashes)
+                        active_mods_per_file.setdefault(path, []).append(mod_obj)
+
+                        mods_desc = sorted(active_mods_per_file[path], key=lambda x: x["start"], reverse=True)
+                        cur_lines = file_contents[path][:]
+                        for m in mods_desc:
+                            cur_lines = cur_lines[:m["start"]] + m["replace"] + cur_lines[m["end"]:]
+
+                        enc, newline_char = resolved_file_enc.get(path, ("utf-8", "\n"))
+                        content = newline_char.join(cur_lines) + newline_char
+                        tmp_path = f"{path}.{secrets.token_hex(4)}.tmp_write"
+                        with open(tmp_path, "w", encoding=enc, newline="") as f:
+                            f.write(content)
+                        os.replace(tmp_path, path)
+
+                        for h in hashes:
+                            indexer.mark_patch_applied(h)
+                        if rel_p not in report.modified_files:
+                            report.modified_files.append(rel_p)
+                        self._log(f"{Colors.GREEN}[УСПЕХ (PATCH)] Обновлен файл: {rel_p}{Colors.RESET}")
+                except Exception as e:
+                    err_str = f"КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПИСИ: {e}"
+                    self._log(f"{Colors.RED}{err_str}{Colors.RESET}")
+                    if tm._active_tx_id is not None:
+                        tm.undo_last(indexer=indexer, quiet=self.quiet)
+                    report.errors.append(err_str)
+                    report.duration_seconds = time.time() - start_time
+                    return report
+
+            elif op_type == "SHELL":
+                payload: ScriptBlockPayload = item["payload"]
+                shell_label = "CMD" if payload.shell_type.lower() == "cmd" else "PowerShell"
+                self._log(
+                    f"\n{Colors.YELLOW}--- Действие {op_idx}/{total_ops} [{shell_label}] "
+                    f"(строки {payload.start_line}-{payload.end_line}) ---{Colors.RESET}"
+                )
+                summary = PowerShellSecurityOrchestrator.dispatch(
+                    raw_script=payload.command,
+                    root_dir=self.root_dir,
+                    tm=tm,
+                    indexer=indexer,
+                    is_auto=self.auto_mode,
+                    disable_all_except_write=self.disable_all_except_write,
+                    unsafe_direct_ps=self.unsafe_direct_ps,
+                    quiet=self.quiet,
+                    shell_type=payload.shell_type
+                )
+                report.ps_summaries.append(summary)
+
+                if summary.strategy == ExecutionStrategy.REJECTED and summary.exit_code == 0:
+                    self._log(f"{Colors.YELLOW}[ПРОПУЩЕНО] {summary.stdout}{Colors.RESET}")
+                    continue
+
+                if not summary.success:
+                    self._log(
+                        f"{Colors.YELLOW}[ВНИМАНИЕ ({summary.strategy.value})] Действие {op_idx}/{total_ops} ({shell_label}) "
+                        f"завершилось с кодом {summary.exit_code} (работа продолжается, файлы сохранены).{Colors.RESET}"
+                    )
+                    if summary.stdout:
+                        self._log(summary.stdout)
+                    if summary.stderr and summary.stderr != summary.error_message:
+                        self._log(f"{Colors.YELLOW}{summary.stderr}{Colors.RESET}")
+                    if summary.error_message:
+                        self._log(f"{Colors.RED}{summary.error_message}{Colors.RESET}")
+                else:
+                    self._log(f"{Colors.GREEN}[УСПЕХ ({summary.strategy.value})] {summary.stdout}{Colors.RESET}")
+                    if summary.stderr:
+                        self._log(f"{Colors.YELLOW}{summary.stderr}{Colors.RESET}")
+                    if summary.target_path:
+                        rel_t = safe_relpath(summary.target_path, start=str(self.root_dir))
+                        if summary.was_new_file:
+                            if rel_t not in report.created_files:
+                                report.created_files.append(rel_t)
+                        else:
+                            if rel_t not in report.modified_files:
+                                report.modified_files.append(rel_t)
+
+        # Актуализируем базу SQLite для всех созданных и измененных файлов
         indexer.sync_and_read(self.ignore_folders, self.ignore_files, prompt_filenames, quiet=self.quiet)
 
+        report.transaction_id = tm._active_tx_id
         report.success = True
         report.duration_seconds = time.time() - start_time
 
         self._log(f"\n{Colors.GREEN}{'=' * 60}")
-        self._log("Правки успешно применены.")
-        self._log(f"Всего обработано блоков: {len(blocks)} (применено: {report.blocks_applied})")
+        self._log("Все операции успешно завершены.")
+        self._log(f"Всего выполнено действий: {total_ops} (блоков замены: {len(blocks)}, создано файлов: {len(report.created_files)}, команд: {len(ps_commands)})")
         self._log(f"Изменено файлов: {len(report.modified_files)}")
         self._log(f"{'=' * 60}{Colors.RESET}")
 
